@@ -46,3 +46,9 @@ next-env.d.ts
 
 # scratch — leftover delivery zips, not part of the app
 /_to_delete
+
+# build-time CA certs for sandboxed/proxied CI environments (see Dockerfile) —
+# never real content here in the actual repo, just the directory + .gitkeep
+# so `docker build` always has something to COPY.
+/build-ca/*
+!/build-ca/.gitkeep

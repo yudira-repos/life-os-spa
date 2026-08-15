@@ -21,10 +21,29 @@ makes LifeOS genuinely useful today.
 - **NextAuth (Auth.js v4) with the Google provider**, JWT sessions. No
   Account/Session/VerificationToken tables — we only need "who is this
   Google user," which the `User` row already captures.
-- **SQLite via Prisma** (the new Prisma 7 client + `@prisma/adapter-better-sqlite3`
-  driver adapter). Zero infra to stand up, trivial to swap for Postgres
-  later — that's a one-line adapter change in `src/lib/db.ts`, nothing
-  else in the app changes.
+- **PostgreSQL via Prisma** (the new Prisma 7 client + `@prisma/adapter-pg`
+  driver adapter, pure JS — no native query-engine binary to cross-compile
+  for Docker/Alpine). Started as SQLite for zero-infra local dev; moved to
+  Postgres everywhere (local via `docker compose`, production via
+  Railway's managed Postgres) once deployment target was decided, so
+  there's one migration history and one dialect instead of two diverging
+  ones. `src/lib/db.ts` is the only file that knows about the driver
+  adapter.
+- **Redis**, provisioned and health-checked (`src/lib/redis.ts`,
+  `GET /api/health`) but not used by any feature yet — same
+  "registered, not deeply used" pattern as PropertyOS/HealthOS below.
+  No feature reads/writes through it today, so there's no
+  cache-invalidation correctness surface to get wrong for zero present
+  benefit. Add real usage (session cache, rate limiting, background job
+  queue) when a feature actually needs it.
+- **Docker + Railway** for deployment — a multi-stage `Dockerfile`
+  (Next.js `output: "standalone"`, non-root user, `prisma migrate deploy`
+  run automatically on every container start) and `railway.toml`. Local
+  dev runs the app directly (`npm run dev`, for fast reload) against
+  Postgres/Redis started via `docker compose up -d` — the app itself is
+  only containerized for the Railway deploy path, not for local dev. See
+  the README's Deployment section for the one-time Railway dashboard
+  setup (Postgres/Redis plugins, env vars, OAuth redirect URI).
 - **Module boundary discipline instead of real microfrontends today.**
   Each OS lives in its own route folder, only talks to shared code
   through defined contracts (the module registry, the entitlement check,
@@ -147,7 +166,11 @@ src/lib/modules.config.ts         — the module registry
 src/lib/entitlements.ts           — the server-side gate every module calls
 src/lib/auth.ts                   — NextAuth config (Google provider, JWT callbacks)
 src/lib/session.ts                — getCurrentUser() / getCurrentHousehold()
-src/lib/db.ts                     — Prisma client + SQLite driver adapter
+src/lib/db.ts                     — Prisma client + Postgres driver adapter
+src/lib/redis.ts                  — Redis client, provisioned but not yet used by any feature
+src/app/api/health/route.ts       — Railway deploy health check: verifies Postgres + Redis are reachable
+Dockerfile, docker-compose.yml,
+railway.toml                      — see README's Deployment section
 src/lib/seed-content.ts           — static FunOS content, and the pre-Studies age-band fallback KidsOS uses for kids without a grade set
 src/lib/kidsos/                   — KidsOS Studies engine: curriculum, problem-bank, grading, gamification, progress (the one place that writes Mastery/PracticeSession/PointsEntry/Streak/EarnedBadge), activities & careers catalogs, authz
 src/components/shell/AppShell.tsx — nav, rendered from the module registry

@@ -1,0 +1,26 @@
+# Railway deploy config. Railway auto-detects the Dockerfile; this just
+# pins the health check and restart behavior explicitly instead of relying
+# on defaults.
+#
+# Setup on Railway (one-time, in the Railway dashboard — not via this file):
+#   1. New Project -> Deploy from GitHub repo -> yudira-repos/life-os-spa
+#   2. Add a Postgres plugin to the project -> Railway sets DATABASE_URL
+#      automatically on the web service (reference variable).
+#   3. Add a Redis plugin to the project -> Railway sets REDIS_URL
+#      automatically the same way.
+#   4. Set these env vars on the web service manually (see .env.example):
+#      GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, NEXTAUTH_SECRET, NEXTAUTH_URL
+#      (NEXTAUTH_URL = the Railway-assigned or custom domain, e.g.
+#      https://life-os-spa-production.up.railway.app)
+#   5. Add that same domain's /api/auth/callback/google redirect URI in the
+#      Google Cloud OAuth client (see README.md).
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = "/api/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
