@@ -14,7 +14,18 @@ built yet.
 npm install
 ```
 
-**2. Create a Google OAuth client**
+**2. Start local Postgres + Redis**
+
+```bash
+docker compose up -d
+```
+
+This runs Postgres and Redis in Docker, matching what Railway provisions in
+production (see [Deployment](#deployment-docker--railway) below). The app
+itself still runs directly on your machine via `npm run dev` for a fast dev
+loop — `docker compose` only brings up the two infra containers.
+
+**3. Create a Google OAuth client**
 
 Google Cloud Console → [APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials)
 → **Create Credentials → OAuth client ID** → Application type: **Web application**.
@@ -26,23 +37,24 @@ Google Cloud Console → [APIs & Services → Credentials](https://console.cloud
 
 Copy the generated **Client ID** and **Client secret**.
 
-**3. Configure environment**
+**4. Configure environment**
 
 ```bash
 cp .env.example .env.local
 ```
 
 Fill in `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `NEXTAUTH_SECRET`
-(generate one with `openssl rand -base64 32`). `DATABASE_URL` is already set
-to a local SQLite file — nothing else to configure.
+(generate one with `openssl rand -base64 32`). `DATABASE_URL` and
+`REDIS_URL` are already set to match `docker compose up -d` above — nothing
+else to configure for local dev.
 
-**4. Set up the database**
+**5. Set up the database**
 
 ```bash
 npx prisma migrate deploy
 ```
 
-**5. Run it**
+**6. Run it**
 
 ```bash
 npm run dev
@@ -78,6 +90,46 @@ and you're in.
 Every module route checks its entitlement **server-side** — see
 `src/lib/entitlements.ts` and how each `(shell)/app/*/page.tsx` calls
 `isEntitled()` before rendering anything real.
+
+## Deployment (Docker + Railway)
+
+The app ships as a multi-stage `Dockerfile` (Next.js standalone output,
+non-root user, migrations applied automatically on container start) and a
+`railway.toml` that points Railway at it. One-time setup in the Railway
+dashboard:
+
+1. **New Project → Deploy from GitHub repo** → this repo.
+2. **Add a Postgres plugin** to the project — Railway sets `DATABASE_URL`
+   on the web service automatically.
+3. **Add a Redis plugin** to the project — same thing for `REDIS_URL`.
+   Nothing depends on Redis yet (see DESIGN.md); it's provisioned and
+   health-checked, not on the critical path for anything today.
+4. **Set these env vars manually** on the web service (see `.env.example`):
+   `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `NEXTAUTH_SECRET`,
+   `NEXTAUTH_URL` (the Railway-assigned or custom domain, e.g.
+   `https://life-os-spa-production.up.railway.app`).
+5. **Add that domain's redirect URI** —
+   `https://<your-railway-domain>/api/auth/callback/google` — to the same
+   Google OAuth client from setup step 3 above.
+
+Railway auto-detects and builds the `Dockerfile` on every push to `main`.
+`GET /api/health` checks both Postgres and Redis are actually reachable
+(not just that the process started) and is wired as the deploy health
+check in `railway.toml`.
+
+To build and smoke-test the image locally before pushing:
+
+```bash
+docker build -t life-os-spa .
+docker compose up -d   # postgres + redis, if not already running
+docker run --rm -p 3000:3000 --network life-os-spa_default \
+  -e DATABASE_URL="postgresql://lifeos:lifeos@postgres:5432/lifeos" \
+  -e REDIS_URL="redis://redis:6379" \
+  -e NEXTAUTH_SECRET="dev-secret" -e NEXTAUTH_URL="http://localhost:3000" \
+  -e GOOGLE_CLIENT_ID="..." -e GOOGLE_CLIENT_SECRET="..." \
+  life-os-spa
+curl http://localhost:3000/api/health
+```
 
 ## Next steps (not built yet, see DESIGN.md)
 

@@ -1,17 +1,15 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { GeistSans } from "geist/font/sans";
+import { GeistMono } from "geist/font/mono";
 import "./globals.css";
 import { AuthProvider } from "@/components/providers/AuthProvider";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
-});
+// Self-hosted via the `geist` package (next/font/local under the hood) —
+// same fonts as next/font/google's Geist/Geist_Mono, but bundled locally so
+// the Docker build never needs to reach fonts.googleapis.com. Fragile build-time
+// network fetches are exactly the kind of thing that breaks in CI/Docker.
+const geistSans = GeistSans;
+const geistMono = GeistMono;
 
 export const metadata: Metadata = {
   title: "LifeOS",
