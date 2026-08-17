@@ -45,6 +45,13 @@ model Household {
   insurancePolicies       InsurancePolicy[]
   recommendationSnapshots RecommendationSnapshot[]
   financialAuditLogs      FinancialAuditLog[]
+
+  // TravelOS
+  travelPreferences TravelPreferences?
+  schoolCalendars   SchoolCalendar[]
+  blackoutPeriods   BlackoutPeriod[]
+  travelWindows     TravelWindow[]
+  trips             Trip[]
 }
 
 enum Role {
@@ -87,6 +94,11 @@ model HouseholdMember {
   ownedAccounts     FinancialAccount[] @relation("AccountOwner")
   goalsFor          SavingsGoal[]      @relation("GoalForMember")
   insurancePolicies InsurancePolicy[]  @relation("PolicyMember")
+
+  // TravelOS
+  schoolCalendars    SchoolCalendarChild[] @relation("CalendarChild")
+  travelAvailability TravelAvailability?   @relation("TravelAvailability")
+  blackoutPeriods    BlackoutPeriod[]      @relation("BlackoutMember")
 }
 
 // --- KidsOS: Studies (mastery, practice, gamification) ---------------------
@@ -518,4 +530,237 @@ model FinancialAuditLog {
   household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
 
   @@index([householdId, createdAt])
+}
+
+// --- TravelOS ---------------------------------------------------------------
+// Plan trips around when the family can actually go.
+//
+// The chain is: school calendar -> no-school days -> contiguous breaks ->
+// windows the whole household can travel in -> destinations that suit that
+// window -> real flight prices -> a human confirms -> a trip and a funded
+// savings goal.
+//
+// Two rules hold throughout:
+//
+//   1. Nothing extracted from a PDF is trusted until a human confirms it. A
+//      calendar sits in DRAFT with per-entry confidence until someone reviews
+//      it; a misread date silently corrupts every downstream suggestion.
+//   2. Flight prices are cached, not live, and carry the timestamp they were
+//      seen at. Presenting a stale price as live is the one thing that would
+//      make this feature untrustworthy.
+
+model TravelPreferences {
+  id          String @id @default(cuid())
+  householdId String @unique
+
+  homeAirport      String? // IATA, e.g. "SFO" — the origin for every search
+  maxFlightHours   Int     @default(6)
+  domesticOnly     Boolean @default(false)
+  passportsReady   Boolean @default(false)
+  budgetPerTripCents Int   @default(0)
+  preferredStyles  String? // CSV of DestinationStyle keys, e.g. "BEACH,NATURE"
+  currency         String  @default("USD")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+}
+
+// One uploaded school calendar. Shared across siblings at the same school via
+// the join table rather than duplicated per child.
+model SchoolCalendar {
+  id          String @id @default(cuid())
+  householdId String
+
+  name       String
+  schoolName String?
+  sourceType String // ICS | CSV | PDF | IMAGE | MANUAL
+  sourceFileName String?
+  schoolYearStart DateTime?
+  schoolYearEnd   DateTime?
+
+  // DRAFT until a human has reviewed the extracted dates. Only CONFIRMED
+  // calendars feed the window engine.
+  status String @default("DRAFT")
+
+  // Provenance for anything a model extracted, so a bad parse is traceable.
+  extractionModel String?
+  extractionNotes String?
+
+  createdByUserId String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  household Household             @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  entries   SchoolCalendarEntry[]
+  children  SchoolCalendarChild[]
+
+  @@index([householdId, status])
+}
+
+model SchoolCalendarChild {
+  id         String @id @default(cuid())
+  calendarId String
+  childId    String
+
+  calendar SchoolCalendar  @relation(fields: [calendarId], references: [id], onDelete: Cascade)
+  child    HouseholdMember @relation("CalendarChild", fields: [childId], references: [id], onDelete: Cascade)
+
+  @@unique([calendarId, childId])
+}
+
+model SchoolCalendarEntry {
+  id         String @id @default(cuid())
+  calendarId String
+
+  startDate DateTime
+  endDate   DateTime
+  title     String
+  kind      String // BREAK | HOLIDAY | TEACHER_DAY | EARLY_RELEASE | FIRST_DAY | LAST_DAY | OTHER
+  noSchool  Boolean @default(true)
+
+  // Extraction provenance. `confidence` is only meaningful for LLM source.
+  source     String  @default("PARSED") // PARSED | LLM | MANUAL
+  confidence Float?
+  confirmed  Boolean @default(false)
+  rawText    String?
+
+  createdAt DateTime @default(now())
+
+  calendar SchoolCalendar @relation(fields: [calendarId], references: [id], onDelete: Cascade)
+
+  @@index([calendarId, startDate])
+}
+
+// Per-adult travel availability. School breaks alone don't determine when a
+// family can go — someone has to be able to take the time off.
+model TravelAvailability {
+  id       String @id @default(cuid())
+  memberId String @unique
+
+  ptoDaysPerYear   Int @default(15)
+  ptoDaysRemaining Int @default(15)
+  notes            String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  member HouseholdMember @relation("TravelAvailability", fields: [memberId], references: [id], onDelete: Cascade)
+}
+
+model BlackoutPeriod {
+  id          String @id @default(cuid())
+  householdId String
+  memberId    String?
+
+  startDate DateTime
+  endDate   DateTime
+  reason    String?
+
+  createdAt DateTime @default(now())
+
+  household Household        @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  member    HouseholdMember? @relation("BlackoutMember", fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@index([householdId, startDate])
+}
+
+// A stretch of time the whole household could travel. Regenerated from the
+// calendars on demand — a cache of the engine's output, not a source of truth,
+// except for `status`, which is the human's decision and survives regeneration.
+model TravelWindow {
+  id          String @id @default(cuid())
+  householdId String
+
+  label     String
+  startDate DateTime
+  endDate   DateTime
+
+  totalDays        Int
+  schoolDaysMissed Int @default(0)
+  ptoDaysRequired  Int @default(0)
+
+  score           Float   @default(0)
+  seasonLabel     String? // PEAK | SHOULDER | OFF_PEAK
+  reasons         Json?
+  conflicts       Json?
+
+  status String @default("SUGGESTED") // SUGGESTED | SHORTLISTED | CONFIRMED | DISMISSED
+
+  engineVersion String?
+  generatedAt   DateTime @default(now())
+
+  household    Household      @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  flightOptions FlightOption[]
+  trips        Trip[]
+
+  @@unique([householdId, startDate, endDate])
+  @@index([householdId, status])
+}
+
+// A concrete flight option shown to the user. Stored with the price's
+// observation time and a booking link — LifeOS never books anything itself.
+model FlightOption {
+  id       String  @id @default(cuid())
+  windowId String?
+  tripId   String?
+
+  origin      String
+  destination String
+  destinationName String?
+
+  departAt DateTime
+  returnAt DateTime?
+
+  priceCents Int
+  currency   String @default("USD")
+
+  airline        String?
+  flightNumber   String?
+  transfers      Int     @default(0)
+  durationMinutes Int?
+
+  bookingUrl  String?
+  provider    String   @default("TRAVELPAYOUTS")
+  priceSeenAt DateTime // when the provider last observed this fare
+  fetchedAt   DateTime @default(now())
+  rank        Int      @default(0)
+
+  window TravelWindow? @relation(fields: [windowId], references: [id], onDelete: Cascade)
+  trip   Trip?         @relation(fields: [tripId], references: [id], onDelete: SetNull)
+
+  @@index([windowId, rank])
+}
+
+// A window a human confirmed, with a destination chosen.
+model Trip {
+  id          String @id @default(cuid())
+  householdId String
+  windowId    String?
+
+  name            String
+  destinationCode String? // IATA
+  destinationName String?
+  startDate       DateTime
+  endDate         DateTime
+
+  status String @default("PLANNING") // PLANNING | BOOKED | COMPLETED | CANCELLED
+
+  estimatedCostCents Int @default(0)
+  // The FinancialOS savings goal funding this trip. A plain id, not a
+  // relation into FinancialOS internals — the modules stay decoupled and
+  // TravelOS goes through src/lib/travelos/integrations.ts to touch it.
+  savingsGoalId String?
+
+  notes String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  household Household     @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  window    TravelWindow? @relation(fields: [windowId], references: [id], onDelete: SetNull)
+  flights   FlightOption[]
+
+  @@index([householdId, startDate])
 }

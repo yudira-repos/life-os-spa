@@ -62,9 +62,9 @@ export const MODULES: ModuleDefinition[] = [
     id: "travel",
     name: "TravelOS",
     route: "/app/travel",
-    tagline: "Plan trips around your family's real availability.",
+    tagline: "Plan trips around the school calendar and real time off.",
     icon: "plane",
-    status: "comingSoon",
+    status: "live",
   },
   {
     id: "financial",

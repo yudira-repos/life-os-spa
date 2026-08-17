@@ -200,6 +200,123 @@ confirmed absent from the real product, which has only a free-text
 `interests` field. Static catalogs for V1; a family marks an activity
 interested/active or bookmarks a career, no scheduling/matching yet.
 
+## TravelOS
+
+Plan trips around when the family can actually go. The chain is:
+
+```
+school calendar (.ics/.csv/PDF/photo)
+        -> no-school days, reviewed by a human
+        -> contiguous breaks per child
+        -> intersect across children  <- the part you can't do by eye
+        -> subtract blackouts, cost PTO, price the season
+        -> ranked travel windows
+        -> destinations that suit that window
+        -> real cached flight prices
+        -> a human confirms
+        -> a trip + a funded FinancialOS savings goal
+```
+
+### The data model
+
+```
+TravelPreferences  (householdId, homeAirport, maxFlightHours, domesticOnly, budget, styles)
+SchoolCalendar     (householdId, sourceType, status[DRAFT|CONFIRMED], extractionModel)
+SchoolCalendarChild(calendarId, childId)  -- siblings share one calendar
+SchoolCalendarEntry(calendarId, start, end, kind, noSchool, source, confidence, confirmed)
+TravelAvailability (memberId, ptoDaysPerYear, ptoDaysRemaining)
+BlackoutPeriod     (householdId, memberId?, start, end, reason)
+TravelWindow       (householdId, start, end, totalDays, ptoDaysRequired, score, status)
+FlightOption       (windowId?, tripId?, price, airline, bookingUrl, priceSeenAt)
+Trip               (householdId, windowId?, destination, dates, savingsGoalId)
+```
+
+### Four decisions worth stating
+
+**A date is a calendar day, not an instant.** Everything goes through
+`dates.ts` and is stored at UTC midnight. A break starting "March 23" starts
+on March 23 in every timezone. This is the single most common source of
+off-by-one-day bugs in calendar code, and the verification script asserts
+timezone stability explicitly.
+
+**ICS `DTEND` is exclusive.** A one-day holiday on the 23rd is
+`DTSTART=20270323, DTEND=20270324`. Treating that as inclusive adds a phantom
+day to every break and produces vacation windows the school never gave you.
+Handled once in `calendar/parse.ts`, asserted in the tests.
+
+**Nothing extracted is trusted.** A calendar read from a PDF or a photo lands
+in `DRAFT` with a per-entry confidence score and `confirmed: false`. It cannot
+be confirmed while any entry is unreviewed, and only `CONFIRMED` calendars
+feed the window engine. Editing an entry flips its source to `MANUAL`, so six
+months later it's clear which dates a person actually checked.
+
+**Prices are cached, and say so.** See the flights note below.
+
+### The window engine
+
+`src/lib/travelos/windows.ts` is pure — no database, no network. Same shape
+and same reasoning as the FinancialOS advice engine: deterministic, every
+output carries the reasons that produced it, and `service.ts` is the only
+thing that touches Prisma.
+
+The interesting step is the intersection. Two children at different schools
+have overlapping-but-not-identical breaks, and the shared stretch is
+routinely several days shorter than either parent assumed. Weekends count as
+free for everyone (otherwise every break fragments at the weekend), but a run
+containing no weekday is discarded — a weekend is not a travel window.
+
+Scoring is stated in the code and shown in the UI: length, cost seasonality,
+PTO cost (working days minus federal holidays, computed by rule rather than
+listed so they don't expire), lead time, and conflicts. A blackout demotes a
+window and prints the reason; it never silently removes it.
+
+### Flights: a provider constraint, made visible
+
+`src/lib/travelos/flights.ts` is the only file that talks to a flight
+provider. It uses Travelpayouts' Aviasales Data API (`/aviasales/v3/...` —
+the v1 endpoints are deprecated).
+
+That choice was forced: Amadeus decommissioned its self-service API on
+17 July 2026, and Kiwi and Skyscanner are partner-approval only. What remains
+self-serve returns **cached** fares — real prices from recent searches, not a
+live quote.
+
+So the module never claims otherwise. Every `FlightOption` stores
+`priceSeenAt`, the UI prints "cached fare, checked Nh ago", and booking links
+send you to the airline to see the real number. **LifeOS never books
+anything.** Presenting a two-day-old fare as bookable-right-now is the one
+failure that would make the whole feature untrustworthy.
+
+### Cross-module integrations
+
+`src/lib/travelos/integrations.ts` is the entire cross-module surface — no
+other file in TravelOS reaches into another module. Calls are one-directional
+(TravelOS calls out; nothing calls in) and every one degrades to nothing if
+the other module isn't entitled.
+
+- **FinancialOS** — confirming a trip creates or updates a vacation savings
+  goal with a real target date (a month before departure, because the trip
+  gets booked before it happens). This closes the loop on "save for vacation":
+  the deadline is a school break we detected, not a number someone guessed.
+  Deleting a trip does **not** delete the goal — money set aside is still money
+  set aside.
+- **KidsOS** — windows are checked against children's ACTIVE activities. Those
+  carry no dates, so this surfaces as "check the schedule", not a hard
+  conflict. Overstating it would train people to ignore the warnings.
+- **FunOS** — short windows get local ideas instead of flight prices.
+
+This is the module that most wants a domain event bus. It doesn't have one
+yet, and this file is what gets rewritten when it arrives.
+
+### Access control
+
+Two tiers, because the module holds two kinds of data. **Viewer** (any member,
+including children) sees calendars, breaks and confirmed trips — a ten-year-old
+should be able to see when spring break is. **Planner** (OWNER/ADULT) is
+required for budgets, PTO balances, blackouts, flight prices, and anything that
+touches a savings goal. Deliberately softer than FinancialOS: a bank balance is
+not family information the way a school holiday is.
+
 ## The module registry — the extensibility seam
 
 `src/lib/modules.config.ts` is the one place that knows what OS modules
@@ -251,13 +368,14 @@ else in the app.
 ## What's explicitly deferred
 
 Real independent microfrontend deploys · multi-service backend split ·
-domain event bus (`SCHOOL_HOLIDAY_CREATED` etc.) · shared calendar
-aggregation across modules · centralized notification service · real AI
-assistant / intent router · Stripe/billing · Apple/Microsoft/passkey
-login · feature flags · observability pipeline · PropertyOS/HealthOS/
-TravelOS real business logic · extra hardening for Health data (HealthOS
-still needs the stronger access controls FinancialOS now has, before real
-health data is entered).
+domain event bus (`SCHOOL_HOLIDAY_CREATED` etc. — TravelOS is the first
+module that would genuinely use one; see its integrations note below) ·
+shared calendar aggregation across modules · centralized notification
+service · real AI assistant / intent router · Stripe/billing ·
+Apple/Microsoft/passkey login · feature flags · observability pipeline ·
+PropertyOS/HealthOS real business logic · extra hardening for Health data
+(HealthOS still needs the stronger access controls FinancialOS now has,
+before real health data is entered).
 
 ## File map
 
@@ -277,7 +395,11 @@ src/lib/kidsos/                   — KidsOS Studies engine: curriculum, problem
 src/lib/financialos/              — FinancialOS: constants (IRS figures, one file per tax year), money (integer cents), crypto (AES-256-GCM), authz (the adults-only gate), audit, plaid (the only file importing the SDK), sync (the sign flip, idempotent upserts), categories/categorize, cashflow, profile, goals, learn, explain (the LLM boundary), advice/ (the rules engine)
 src/app/api/financial/            — Plaid link/exchange/sync/webhook/unlink, accounts, transactions, rules, profile, earners, goals, insurance, recommendations, explain
 src/app/(shell)/app/financial/    — FinancialOS: Overview, Accounts, Transactions, Cashflow, Plan, Goals, Learn, Setup (the layout is the module-wide adults-only gate)
+src/lib/travelos/                 — TravelOS: dates (UTC calendar days), calendar/parse (ICS+CSV, no deps) & calendar/extract (PDF/photo via the model, everything unconfirmed), holidays (computed by rule), seasonality, windows (the pure engine), destinations (curated catalog), flights (the only file talking to a flight provider), integrations (the entire cross-module surface), authz (viewer vs planner), service (engine <-> database)
+src/app/api/travel/               — calendar upload/review/confirm, windows, flight search, trip confirmation, preferences, PTO, blackouts
+src/app/(shell)/app/travel/       — TravelOS: Windows, School calendars (+ per-calendar review), Trips, Settings
 scripts/verify-advice-engine.ts   — 53 assertions against the advice engine, no DB (npm run verify:advice)
+scripts/verify-travel-engine.ts   — 40 assertions against calendar parsing and the window engine (npm run verify:travel)
 src/components/shell/AppShell.tsx — nav, rendered from the module registry
 src/components/kidsos/            — child sub-nav, practice session UI, activity/career toggles
 src/app/(shell)/app/kids/         — KidsOS: overview + per-child Today/Study/Practice/Activities/Careers/Progress
@@ -294,3 +416,6 @@ Stripe checkout for "buy a module" once there's something worth paying
 for. Inside FinancialOS: a background job for scheduled syncs rather than
 webhook-plus-button, investment holdings via Plaid's /investments
 endpoints, and letting a household mark a recommendation as dismissed.
+Inside TravelOS: hotel pricing, a packing/todo checklist per trip, and
+subscribing to a school's ICS feed by URL so calendars refresh themselves
+instead of being re-uploaded each year.

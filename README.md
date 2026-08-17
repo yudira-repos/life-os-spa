@@ -66,6 +66,13 @@ button on recommendations. It rewrites already-decided advice in warmer
 language; without the key the module falls back to the rules' own wording and
 nothing else changes.
 
+For **TravelOS**, set `TRAVELPAYOUTS_TOKEN` — free and instant on signup at
+<https://travelpayouts.com>, no approval needed. It supplies cached flight
+prices (real fares seen in the last few days, not a live search, which is why
+every price shows when it was last checked). The same `ANTHROPIC_API_KEY`
+enables reading PDF and photo school calendars; `.ics` and `.csv` uploads work
+without it.
+
 **5. Set up the database**
 
 ```bash
@@ -110,10 +117,19 @@ and you're in.
   arithmetic and its sources. There's also a Learn library of plain-language
   explanations for anyone who was never taught this. Access is restricted to
   OWNER/ADULT members and every access is audited; see DESIGN.md.
-- **PropertyOS / HealthOS / TravelOS** → registered as real modules with
-  real routes and real entitlement checks, showing a "coming soon" /
-  "locked" placeholder — proving modules can be added without rewriting
-  the Shell.
+- **TravelOS** → upload each child's school calendar (.ics/.csv parsed
+  exactly; PDF or a photo of the printed calendar read by a model, with
+  every date reviewed by you before it counts), and it works out the
+  stretches when the whole family is off at once — intersecting siblings'
+  calendars, bridging weekends, subtracting blackout periods, costing the
+  PTO each window needs, and flagging the expensive travel weeks. Pick a
+  window and it suggests destinations that suit those dates and those kids'
+  ages, prices real flights, and on confirmation creates a vacation savings
+  goal in FinancialOS with a deadline a month before departure. It never
+  books anything.
+- **PropertyOS / HealthOS** → registered as real modules with real routes
+  and real entitlement checks, showing a "coming soon" / "locked"
+  placeholder — proving modules can be added without rewriting the Shell.
 - **Settings** → household name, family member list, add a member.
 - **Subscription** → shows what's included, in plain language. No billing
   yet, on purpose.
@@ -125,12 +141,15 @@ also checks the member's role, because bank balances aren't household-wide
 information the way a shared calendar is — see
 `src/lib/financialos/authz.ts`.
 
-FinancialOS is not enabled on the FREE plan. To turn it on for a household
-during development:
+Neither FinancialOS nor TravelOS is on the FREE plan. To turn them on for
+every household in your local database:
 
-```sql
-INSERT INTO "Entitlement" ("id", "householdId", "moduleId", "enabled")
-VALUES (gen_random_uuid()::text, '<household-id>', 'financial', true);
+```bash
+docker compose exec -T postgres psql -U lifeos -d lifeos -c \
+"INSERT INTO \"Entitlement\" (\"id\",\"householdId\",\"moduleId\",\"enabled\")
+ SELECT gen_random_uuid()::text, h.id, m, true
+ FROM \"Household\" h, (VALUES ('financial'),('travel')) AS t(m)
+ ON CONFLICT (\"householdId\",\"moduleId\") DO UPDATE SET \"enabled\" = true;"
 ```
 
 ## Deployment (Docker + Railway)
@@ -150,7 +169,8 @@ dashboard:
    `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `NEXTAUTH_SECRET`,
    `NEXTAUTH_URL` (the Railway-assigned or custom domain, e.g.
    `https://life-os-spa-production.up.railway.app`), plus the FinancialOS
-   ones: `FINANCIAL_ENC_KEY`, `PLAID_CLIENT_ID`, `PLAID_SECRET`, `PLAID_ENV`.
+   ones: `FINANCIAL_ENC_KEY`, `PLAID_CLIENT_ID`, `PLAID_SECRET`, `PLAID_ENV`,
+   and TravelOS's `TRAVELPAYOUTS_TOKEN`.
    Set `PLAID_WEBHOOK_URL` to the deployed domain so Plaid can push
    transaction updates — it can't reach localhost, which is why webhooks are
    inert in local dev and you sync with the button instead.
@@ -181,23 +201,35 @@ docker run --rm -p 3000:3000 --network life-os-spa_default \
 curl http://localhost:3000/api/health
 ```
 
-## Verifying FinancialOS
+## Verifying the engines
 
 ```bash
-npm run verify:advice
+npm run verify          # both suites
+npm run verify:advice   # FinancialOS — 53 assertions
+npm run verify:travel   # TravelOS — 40 assertions
 ```
 
-53 assertions against the advice engine — no database, no network. It checks
-the things that cost real money if they're wrong: that the employer match is
-ordered ahead of credit card debt, that a pre-tax IRA balance triggers the
-pro-rata warning before a Backdoor Roth is recommended, that the Mega
-Backdoor Roth is never suggested without the plan features that make it
-possible, that the Roth phase-out and catch-up age bands match the published
-2026 figures, and that the engine is deterministic.
+No database, no network, no API keys — both engines are pure functions, so
+the whole chain can be asserted directly.
+
+The FinancialOS suite checks the things that cost real money if they're
+wrong: that the employer match is ordered ahead of credit card debt, that a
+pre-tax IRA balance triggers the pro-rata warning before a Backdoor Roth is
+recommended, that the Mega Backdoor Roth is never suggested without the plan
+features that make it possible, and that the Roth phase-out and catch-up age
+bands match the published 2026 figures.
+
+The TravelOS suite checks the things that would send a family to the airport
+on a school day: that an ICS `DTEND` is treated as exclusive, that a date
+parses to the same day in every timezone, that two siblings' overlapping
+breaks intersect to only the shared days, that PTO cost excludes federal
+holidays, and that a blackout demotes a window with its reason shown rather
+than hiding it.
 
 ## Next steps (not built yet, see DESIGN.md)
 
 Real recommendation logic instead of static content in KidsOS/FunOS, one more
 module built out for real (HealthOS should adopt the FinancialOS
 access-control pattern), then a simple Stripe checkout once there's something
-worth paying for.
+worth paying for. See DESIGN.md for what's next inside FinancialOS and
+TravelOS.

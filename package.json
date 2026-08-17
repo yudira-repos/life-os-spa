@@ -8,7 +8,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "verify:advice": "tsx scripts/verify-advice-engine.ts"
+    "verify:advice": "tsx scripts/verify-advice-engine.ts",
+    "verify:travel": "tsx scripts/verify-travel-engine.ts",
+    "verify": "npm run verify:advice && npm run verify:travel"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.117.1",
