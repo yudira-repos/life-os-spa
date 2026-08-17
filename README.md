@@ -48,6 +48,24 @@ Fill in `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `NEXTAUTH_SECRET`
 `REDIS_URL` are already set to match `docker compose up -d` above — nothing
 else to configure for local dev.
 
+For **FinancialOS**, two more:
+
+```bash
+# Required before any bank account can be linked. Without it the module
+# refuses to store a Plaid access token rather than writing it in plaintext.
+openssl rand -base64 32   # -> FINANCIAL_ENC_KEY
+```
+
+and Plaid credentials from <https://dashboard.plaid.com> → Team Settings →
+Keys: `PLAID_CLIENT_ID`, `PLAID_SECRET`, and `PLAID_ENV=sandbox`. In sandbox
+you can link Plaid's test institutions with the credentials
+`user_good` / `pass_good`.
+
+Optionally set `ANTHROPIC_API_KEY` to enable the "Explain in plain English"
+button on recommendations. It rewrites already-decided advice in warmer
+language; without the key the module falls back to the rules' own wording and
+nothing else changes.
+
 **5. Set up the database**
 
 ```bash
@@ -79,17 +97,41 @@ and you're in.
   real lifeos-kids product vs. net-new.
 - **FunOS** → real, working, using a small curated static content set (not
   AI-generated yet — see DESIGN.md).
-- **PropertyOS / HealthOS / TravelOS / FinancialOS** → registered as real
-  modules with real routes and real entitlement checks, showing a
-  "coming soon" / "locked" placeholder — proving modules can be added
-  without rewriting the Shell.
+- **FinancialOS** → the second module built for real. Link bank accounts
+  through Plaid (`/transactions/sync`, encrypted access tokens, webhook +
+  manual sync), automatic categorization with rules you can override,
+  income/expense/savings-rate tracking, recurring-charge detection, net
+  worth, savings goals from templates (emergency fund, vacation, house
+  down payment, college, funeral, car, wedding, new baby), and a
+  deterministic advice engine that works the contribution waterfall in
+  order — employer match, HSA, max the 401(k), Roth or Backdoor Roth, Mega
+  Backdoor Roth, 529, taxable index funds — plus term-vs-whole-life,
+  disability, umbrella, and estate basics. Every recommendation shows its
+  arithmetic and its sources. There's also a Learn library of plain-language
+  explanations for anyone who was never taught this. Access is restricted to
+  OWNER/ADULT members and every access is audited; see DESIGN.md.
+- **PropertyOS / HealthOS / TravelOS** → registered as real modules with
+  real routes and real entitlement checks, showing a "coming soon" /
+  "locked" placeholder — proving modules can be added without rewriting
+  the Shell.
 - **Settings** → household name, family member list, add a member.
 - **Subscription** → shows what's included, in plain language. No billing
   yet, on purpose.
 
 Every module route checks its entitlement **server-side** — see
 `src/lib/entitlements.ts` and how each `(shell)/app/*/page.tsx` calls
-`isEntitled()` before rendering anything real.
+`isEntitled()` before rendering anything real. FinancialOS goes further and
+also checks the member's role, because bank balances aren't household-wide
+information the way a shared calendar is — see
+`src/lib/financialos/authz.ts`.
+
+FinancialOS is not enabled on the FREE plan. To turn it on for a household
+during development:
+
+```sql
+INSERT INTO "Entitlement" ("id", "householdId", "moduleId", "enabled")
+VALUES (gen_random_uuid()::text, '<household-id>', 'financial', true);
+```
 
 ## Deployment (Docker + Railway)
 
@@ -107,7 +149,15 @@ dashboard:
 4. **Set these env vars manually** on the web service (see `.env.example`):
    `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `NEXTAUTH_SECRET`,
    `NEXTAUTH_URL` (the Railway-assigned or custom domain, e.g.
-   `https://life-os-spa-production.up.railway.app`).
+   `https://life-os-spa-production.up.railway.app`), plus the FinancialOS
+   ones: `FINANCIAL_ENC_KEY`, `PLAID_CLIENT_ID`, `PLAID_SECRET`, `PLAID_ENV`.
+   Set `PLAID_WEBHOOK_URL` to the deployed domain so Plaid can push
+   transaction updates — it can't reach localhost, which is why webhooks are
+   inert in local dev and you sync with the button instead.
+
+   `FINANCIAL_ENC_KEY` must be the same value everywhere and must not change
+   after accounts are linked: rotating it makes existing Plaid tokens
+   undecryptable and every household would have to re-link.
 5. **Add that domain's redirect URI** —
    `https://<your-railway-domain>/api/auth/callback/google` — to the same
    Google OAuth client from setup step 3 above.
@@ -131,8 +181,23 @@ docker run --rm -p 3000:3000 --network life-os-spa_default \
 curl http://localhost:3000/api/health
 ```
 
+## Verifying FinancialOS
+
+```bash
+npm run verify:advice
+```
+
+53 assertions against the advice engine — no database, no network. It checks
+the things that cost real money if they're wrong: that the employer match is
+ordered ahead of credit card debt, that a pre-tax IRA balance triggers the
+pro-rata warning before a Backdoor Roth is recommended, that the Mega
+Backdoor Roth is never suggested without the plan features that make it
+possible, that the Roth phase-out and catch-up age bands match the published
+2026 figures, and that the engine is deterministic.
+
 ## Next steps (not built yet, see DESIGN.md)
 
-Real recommendation logic instead of static content, one more module built
-out for real, then a simple Stripe checkout once there's something worth
-paying for.
+Real recommendation logic instead of static content in KidsOS/FunOS, one more
+module built out for real (HealthOS should adopt the FinancialOS
+access-control pattern), then a simple Stripe checkout once there's something
+worth paying for.

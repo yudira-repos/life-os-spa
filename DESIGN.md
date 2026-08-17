@@ -93,6 +93,108 @@ COPPA-purge retention policy, campaign multipliers — none of that belongs
 in a household platform (see "keep the licensing model simple" in the
 product ask this was built from).
 
+### FinancialOS
+
+```
+FinancialProfile   (householdId, filingStatus, stateCode, emergencyFundMonthsTarget,
+                    riskTolerance, financialLiteracy, hasWill, highInterestDebt*)
+EarnerProfile      (memberId, salary, bonus, plan features, IRA balance, HSA)
+PlaidItem          (householdId, itemId, accessTokenEnc, cursor, status)
+FinancialAccount   (householdId, plaidAccountId?, type, mask, balanceCents, visibility)
+Transaction        (householdId, accountId, date, amountCents, categoryKey, categorySource)
+CategoryRule       (householdId, matchField, matchType, pattern, categoryKey)
+SavingsGoal        (householdId, templateKey?, kind, targetCents, monthlyContributionCents)
+GoalContribution   (goalId, amountCents, occurredAt)
+InsurancePolicy    (householdId, memberId?, type, coverageCents, annualPremiumCents)
+RecommendationSnapshot (householdId, engineVersion, inputHash, payload)
+ExplanationCache   (cacheKey, ruleId, text, model)
+FinancialAuditLog  (householdId, actorUserId, action, resource, outcome)
+```
+
+Four decisions worth stating, because they're the ones that would be
+expensive to change later:
+
+**Money is integer cents, everywhere.** No floats, no decimal library.
+`src/lib/financialos/money.ts` is the only place that converts. Int caps a
+single row at ~$21.4M — documented, and fine for a household app.
+
+**One sign convention, flipped once.** Plaid reports a grocery charge as
+`+50` and a paycheck as `-2000`. That's inverted from how a person reads a
+ledger, so `sync.ts` flips it exactly once on ingest: positive means money
+in, everywhere else in the codebase. Every downstream total depends on that
+happening once and only once.
+
+**Transfers are not income or spending.** Moving $2,000 from checking to
+savings is neither, and counting it as either is the most common way
+budgeting tools produce numbers nobody believes. `TRANSFER` is its own
+category group, excluded from every total. Money moved into a 401(k) or 529
+counts as *saved*, not spent — otherwise a household that saves hard looks
+like it's overspending.
+
+**A user's category correction is permanent.** Setting a category by hand
+marks the row `categorySource: "USER"`, and no sync ever overwrites it. A
+correction that silently reverts is worse than no correction feature.
+
+### FinancialOS: the advice engine
+
+The recommendation engine (`src/lib/financialos/advice/`) is deterministic —
+same inputs, same output, always. It reads published IRS constants from one
+file (`constants.ts`, tax year 2026, every figure cited to its source) and
+runs a set of pure rules against a context object assembled by `profile.ts`.
+No rule hardcodes a dollar amount, so rolling the tax year forward is one
+file.
+
+The output order is the advice: employer match → HSA → max 401(k) → Roth or
+Backdoor Roth → Mega Backdoor Roth → 529 → taxable index funds, with the
+emergency fund and high-interest debt gating the front of it. Every
+recommendation carries its reasoning (`why`), the arithmetic behind it
+(`math`), and what would change the answer (`caveats`).
+
+The two strategies people most often get wrong are gated on facts we ask for
+rather than infer: the Backdoor Roth checks for a pre-tax IRA balance (the
+pro-rata rule), and the Mega Backdoor Roth checks three specific plan
+features. Where we don't know, the module says "ask your plan administrator
+this exact question" instead of recommending something the user can't do.
+
+`src/lib/financialos/explain.ts` is the only place a language model is
+involved, and the boundary is strict: **the rules decide what to recommend;
+the model only rewrites the why.** It receives an already-decided
+recommendation and returns plainer prose, is cached by (rule, engine version,
+inputs), validates that no dollar figure appeared that wasn't in the source,
+and falls back to the rule's own wording if the key is missing or the call
+fails. A model outage degrades tone, never substance.
+
+`npm run verify:advice` exercises the engine against 53 assertions covering
+the ordering, the phase-outs, the catch-up age bands, the pro-rata warning,
+the Mega Backdoor gating, and determinism — no database, no network.
+
+### FinancialOS: access control
+
+This is the module DESIGN.md previously said needed "explicit, stronger
+access controls than the rest of LifeOS before it's real". What that turned
+into:
+
+- **Adults only.** `requireFinancialAccess()` checks session → entitlement →
+  OWNER/ADULT role, in that order. A CHILD member is a first-class LifeOS
+  user with their own login and their own KidsOS data, and must never read a
+  row from this module. There is no second path in; the module layout and
+  every API route go through the same guard.
+- **Encrypted provider secrets.** Plaid access tokens are AES-256-GCM
+  encrypted before they touch the database (`crypto.ts`), with a version
+  prefix so key rotation doesn't require decrypting everything at once. If
+  `FINANCIAL_ENC_KEY` isn't set, linking is refused rather than storing a
+  bank credential in plaintext.
+- **Record-level visibility.** An account can be marked `OWNER_ONLY` so one
+  adult's account isn't visible to the other. Applied as a Prisma `where`
+  fragment on every account and transaction query, not filtered in the UI.
+- **Audit log.** Every read and write is appended to `FinancialAuditLog`,
+  including denials. It records the shape of an access (who, what action,
+  which record) and never the content — no amounts, balances, account
+  numbers, or merchant names. An audit log that copies the sensitive data
+  it protects is a liability, not a safety feature.
+- **Last four digits only.** Full account numbers are never stored, even on
+  the manual-entry path.
+
 Activities and Career Paths (`activities.ts`, `careers.ts`) are net-new —
 confirmed absent from the real product, which has only a free-text
 `interests` field. Static catalogs for V1; a family marks an activity
@@ -153,10 +255,9 @@ domain event bus (`SCHOOL_HOLIDAY_CREATED` etc.) · shared calendar
 aggregation across modules · centralized notification service · real AI
 assistant / intent router · Stripe/billing · Apple/Microsoft/passkey
 login · feature flags · observability pipeline · PropertyOS/HealthOS/
-TravelOS/FinancialOS real business logic · extra hardening for
-Health/Financial data (must happen before real health/financial data is
-entered — HealthOS and FinancialOS need explicit, stronger access
-controls than the rest of LifeOS before they're real).
+TravelOS real business logic · extra hardening for Health data (HealthOS
+still needs the stronger access controls FinancialOS now has, before real
+health data is entered).
 
 ## File map
 
@@ -173,6 +274,10 @@ Dockerfile, docker-compose.yml,
 railway.toml                      — see README's Deployment section
 src/lib/seed-content.ts           — static FunOS content, and the pre-Studies age-band fallback KidsOS uses for kids without a grade set
 src/lib/kidsos/                   — KidsOS Studies engine: curriculum, problem-bank, grading, gamification, progress (the one place that writes Mastery/PracticeSession/PointsEntry/Streak/EarnedBadge), activities & careers catalogs, authz
+src/lib/financialos/              — FinancialOS: constants (IRS figures, one file per tax year), money (integer cents), crypto (AES-256-GCM), authz (the adults-only gate), audit, plaid (the only file importing the SDK), sync (the sign flip, idempotent upserts), categories/categorize, cashflow, profile, goals, learn, explain (the LLM boundary), advice/ (the rules engine)
+src/app/api/financial/            — Plaid link/exchange/sync/webhook/unlink, accounts, transactions, rules, profile, earners, goals, insurance, recommendations, explain
+src/app/(shell)/app/financial/    — FinancialOS: Overview, Accounts, Transactions, Cashflow, Plan, Goals, Learn, Setup (the layout is the module-wide adults-only gate)
+scripts/verify-advice-engine.ts   — 53 assertions against the advice engine, no DB (npm run verify:advice)
 src/components/shell/AppShell.tsx — nav, rendered from the module registry
 src/components/kidsos/            — child sub-nav, practice session UI, activity/career toggles
 src/app/(shell)/app/kids/         — KidsOS: overview + per-child Today/Study/Practice/Activities/Careers/Progress
@@ -183,6 +288,9 @@ src/app/sign-in/, onboarding/     — everything before a household exists
 ## Next slices (not this one)
 
 Real recommendation logic instead of static KidsOS/FunOS content, one
-more module built out for real (PropertyOS or HealthOS), then a simple
+more module built out for real (PropertyOS or HealthOS — HealthOS should
+adopt the FinancialOS access-control pattern wholesale), then a simple
 Stripe checkout for "buy a module" once there's something worth paying
-for.
+for. Inside FinancialOS: a background job for scheduled syncs rather than
+webhook-plus-button, investment holdings via Plaid's /investments
+endpoints, and letting a household mark a recommendation as dismissed.

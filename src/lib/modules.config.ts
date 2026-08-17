@@ -70,9 +70,9 @@ export const MODULES: ModuleDefinition[] = [
     id: "financial",
     name: "FinancialOS",
     route: "/app/financial",
-    tagline: "Net worth, retirement, and the household financial plan.",
+    tagline: "Accounts, cashflow, and a retirement plan that shows its work.",
     icon: "wallet",
-    status: "comingSoon",
+    status: "live",
   },
 ];
 

@@ -31,9 +31,20 @@ model Household {
   ownerId   String
   createdAt DateTime @default(now())
 
-  owner       User              @relation("HouseholdOwner", fields: [ownerId], references: [id])
-  members     HouseholdMember[]
+  owner        User              @relation("HouseholdOwner", fields: [ownerId], references: [id])
+  members      HouseholdMember[]
   entitlements Entitlement[]
+
+  // FinancialOS
+  financialProfile        FinancialProfile?
+  plaidItems              PlaidItem[]
+  accounts                FinancialAccount[]
+  transactions            Transaction[]
+  categoryRules           CategoryRule[]
+  savingsGoals            SavingsGoal[]
+  insurancePolicies       InsurancePolicy[]
+  recommendationSnapshots RecommendationSnapshot[]
+  financialAuditLogs      FinancialAuditLog[]
 }
 
 enum Role {
@@ -69,6 +80,13 @@ model HouseholdMember {
   badges           EarnedBadge[]
   activities       ChildActivity[]
   careerInterests  ChildCareerInterest[]
+
+  // FinancialOS — adults only in practice; a CHILD member can be the *subject*
+  // of an education goal without ever being able to read financial data.
+  earnerProfile     EarnerProfile?
+  ownedAccounts     FinancialAccount[] @relation("AccountOwner")
+  goalsFor          SavingsGoal[]      @relation("GoalForMember")
+  insurancePolicies InsurancePolicy[]  @relation("PolicyMember")
 }
 
 // --- KidsOS: Studies (mastery, practice, gamification) ---------------------
@@ -178,4 +196,326 @@ model Entitlement {
   household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
 
   @@unique([householdId, moduleId])
+}
+
+// --- FinancialOS -----------------------------------------------------------
+// The most sensitive data in LifeOS. Three rules hold across every model here:
+//
+//   1. Money is stored as INTEGER CENTS (`...Cents`), never floats. Exact
+//      arithmetic, no decimal library. Int caps a single row at ~$21.4M, which
+//      is the documented ceiling for a household app; aggregates are summed in
+//      JS numbers (exact to 2^53 cents).
+//   2. Nothing here is readable by a CHILD or GUEST member. That gate lives in
+//      src/lib/financialos/authz.ts and every route calls it — the entitlement
+//      check alone is NOT sufficient for this module (see DESIGN.md).
+//   3. Provider secrets (Plaid access tokens) are never stored in plaintext.
+//      PlaidItem.accessTokenEnc holds an AES-256-GCM envelope produced by
+//      src/lib/financialos/crypto.ts.
+
+// Household-level tax + planning facts. One row per household. Everything the
+// advice engine needs that isn't derivable from accounts/transactions.
+model FinancialProfile {
+  id          String @id @default(cuid())
+  householdId String @unique
+
+  filingStatus String @default("MARRIED_JOINT") // SINGLE | MARRIED_JOINT | MARRIED_SEPARATE | HEAD_OF_HOUSEHOLD
+  stateCode    String @default("CA") // 2-letter; drives state income tax + 529 deduction rules
+
+  // Self-reported context the engine can't infer from bank data.
+  emergencyFundMonthsTarget Int     @default(6)
+  riskTolerance             String  @default("MODERATE") // CONSERVATIVE | MODERATE | AGGRESSIVE
+  financialLiteracy         String  @default("BEGINNER") // BEGINNER | LEARNING | CONFIDENT — drives how much explaining the UI does
+  hasWill                   Boolean @default(false)
+  hasEstateBeneficiaries    Boolean @default(false)
+
+  // Debt facts that outrank investing in the waterfall but don't always show
+  // up as linked accounts (student loans at a servicer, family loans, etc).
+  highInterestDebtCents Int   @default(0)
+  highInterestDebtApr   Float @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+}
+
+// Per-earning-adult employment + workplace-plan facts. The Backdoor Roth and
+// especially the Mega Backdoor Roth recommendations are entirely gated on
+// plan features (after-tax contributions + in-plan conversion or in-service
+// withdrawal), so those are explicit fields rather than assumptions.
+model EarnerProfile {
+  id       String @id @default(cuid())
+  memberId String @unique
+
+  annualSalaryCents Int     @default(0)
+  annualBonusCents  Int     @default(0)
+  selfEmployed      Boolean @default(false)
+
+  // Workplace retirement plan
+  hasWorkplacePlan          Boolean @default(false)
+  planType                  String  @default("401K") // 401K | 403B | 457B | SIMPLE_IRA | SEP_IRA | SOLO_401K | NONE
+  employerMatchPercent      Float   @default(0) // employer matches this % of pay contributed...
+  employerMatchLimitPercent Float   @default(0) // ...up to this % of pay
+  currentDeferralPercent    Float   @default(0)
+  currentDeferralIsRoth     Boolean @default(false)
+  planAllowsAfterTax        Boolean @default(false) // the Mega Backdoor precondition
+  planAllowsInPlanRoth      Boolean @default(false) // in-plan Roth conversion
+  planAllowsInServiceW      Boolean @default(false) // in-service withdrawal to Roth IRA
+  employerContribCents      Int     @default(0) // non-elective/profit sharing, counts toward 415(c)
+
+  // IRA facts (needed for the pro-rata rule — a pre-tax IRA balance is what
+  // makes a Backdoor Roth expensive, so we ask instead of guessing).
+  traditionalIraBalanceCents Int @default(0)
+  currentIraContribCents     Int @default(0)
+
+  // HSA facts
+  hsaEligible             Boolean @default(false)
+  hsaCoverage             String  @default("NONE") // NONE | SELF | FAMILY
+  currentHsaContribCents  Int     @default(0)
+  employerHsaContribCents Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  member HouseholdMember @relation(fields: [memberId], references: [id], onDelete: Cascade)
+}
+
+// A linked Plaid Item = one institution login. Access token is encrypted.
+model PlaidItem {
+  id          String @id @default(cuid())
+  householdId String
+  itemId      String @unique
+
+  accessTokenEnc  String // "v1:<iv-b64>:<tag-b64>:<ciphertext-b64>" — see crypto.ts
+  institutionId   String?
+  institutionName String?
+
+  status           String    @default("GOOD") // GOOD | LOGIN_REQUIRED | PENDING_EXPIRATION | ERROR | REVOKED
+  statusDetail     String?
+  cursor           String? // /transactions/sync cursor — null means "never synced"
+  lastSyncedAt     DateTime?
+  consentExpiresAt DateTime?
+
+  linkedByUserId String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  household Household          @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  accounts  FinancialAccount[]
+
+  @@index([householdId])
+}
+
+model FinancialAccount {
+  id          String  @id @default(cuid())
+  householdId String
+  plaidItemId String?
+
+  plaidAccountId String? @unique
+  name           String
+  officialName   String?
+  mask           String? // last 4 only — full account numbers are never stored
+  type           String // DEPOSITORY | CREDIT | LOAN | INVESTMENT | OTHER
+  subtype        String?
+
+  currentBalanceCents   Int    @default(0)
+  availableBalanceCents Int?
+  limitCents            Int?
+  isoCurrency           String @default("USD")
+
+  // Loans/credit carry a rate the debt-payoff rule needs.
+  interestRateApr Float?
+
+  isManual          Boolean   @default(false)
+  includeInNetWorth Boolean   @default(true)
+  ownerMemberId     String?
+  visibility        String    @default("HOUSEHOLD") // HOUSEHOLD | OWNER_ONLY
+  closedAt          DateTime?
+  lastRefreshedAt   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  household    Household        @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  plaidItem    PlaidItem?       @relation(fields: [plaidItemId], references: [id], onDelete: Cascade)
+  ownerMember  HouseholdMember? @relation("AccountOwner", fields: [ownerMemberId], references: [id])
+  transactions Transaction[]
+
+  @@index([householdId, type])
+}
+
+// SIGN CONVENTION, stated once and enforced at ingest (see sync.ts):
+//   amountCents > 0  => money INTO the household (income, refunds, transfers in)
+//   amountCents < 0  => money OUT of the household (expenses, transfers out)
+// This is the INVERSE of Plaid's convention, which is normalized on the way in.
+model Transaction {
+  id          String @id @default(cuid())
+  householdId String
+  accountId   String
+
+  plaidTransactionId String?   @unique
+  date               DateTime
+  authorizedDate     DateTime?
+  name               String
+  merchantName       String?
+  amountCents        Int
+  isoCurrency        String    @default("USD")
+  pending            Boolean   @default(false)
+
+  categoryKey      String  @default("uncategorized") // key into src/lib/financialos/categories.ts
+  categorySource   String  @default("PLAID") // PLAID | RULE | USER
+  plaidPfcPrimary  String?
+  plaidPfcDetailed String?
+
+  isTransfer           Boolean @default(false)
+  isRecurring          Boolean @default(false)
+  recurringKey         String?
+  excludedFromCashflow Boolean @default(false)
+  notes                String?
+  goalId               String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  household Household        @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  account   FinancialAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  goal      SavingsGoal?     @relation(fields: [goalId], references: [id])
+
+  @@index([householdId, date])
+  @@index([accountId, date])
+  @@index([householdId, categoryKey])
+}
+
+// User-defined "always categorize X as Y" rules. Applied at ingest and
+// re-runnable over history. Highest priority wins.
+model CategoryRule {
+  id          String @id @default(cuid())
+  householdId String
+
+  matchField     String  @default("NAME") // NAME | MERCHANT
+  matchType      String  @default("CONTAINS") // CONTAINS | EQUALS | STARTS_WITH
+  pattern        String
+  categoryKey    String
+  markAsTransfer Boolean @default(false)
+  priority       Int     @default(100)
+
+  createdAt DateTime @default(now())
+
+  household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+
+  @@index([householdId, priority])
+}
+
+model SavingsGoal {
+  id          String @id @default(cuid())
+  householdId String
+
+  templateKey              String? // key into src/lib/financialos/goals.ts, null for custom
+  name                     String
+  kind                     String // EMERGENCY | VACATION | PROPERTY | EDUCATION | VEHICLE | WEDDING | FUNERAL | DEBT_PAYOFF | CUSTOM
+  targetCents              Int
+  targetDate               DateTime?
+  monthlyContributionCents Int       @default(0)
+  currentCents             Int       @default(0) // manual ledger; kept in sync with contributions
+
+  linkedAccountId String? // if set, progress reads the account balance instead
+  forMemberId     String? // e.g. which child this education goal is for
+  priority        Int     @default(100)
+  status          String  @default("ACTIVE") // ACTIVE | PAUSED | COMPLETE
+  notes           String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  household     Household          @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  forMember     HouseholdMember?   @relation("GoalForMember", fields: [forMemberId], references: [id])
+  contributions GoalContribution[]
+  transactions  Transaction[]
+
+  @@index([householdId, status])
+}
+
+model GoalContribution {
+  id            String   @id @default(cuid())
+  goalId        String
+  amountCents   Int
+  occurredAt    DateTime @default(now())
+  source        String   @default("MANUAL") // MANUAL | TRANSACTION
+  transactionId String?
+  note          String?
+
+  goal SavingsGoal @relation(fields: [goalId], references: [id], onDelete: Cascade)
+
+  @@index([goalId, occurredAt])
+}
+
+model InsurancePolicy {
+  id          String  @id @default(cuid())
+  householdId String
+  memberId    String?
+
+  type               String // TERM_LIFE | WHOLE_LIFE | UNIVERSAL_LIFE | DISABILITY | UMBRELLA
+  carrier            String?
+  coverageCents      Int       @default(0)
+  annualPremiumCents Int       @default(0)
+  termYears          Int?
+  startDate          DateTime?
+  endDate            DateTime?
+  beneficiary        String?
+  notes              String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  household Household        @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  member    HouseholdMember? @relation("PolicyMember", fields: [memberId], references: [id])
+
+  @@index([householdId])
+}
+
+// The advice engine is deterministic, so a snapshot is a cache, not a source
+// of truth — it exists so the UI is fast and so you can see what was
+// recommended (and on what inputs) at a point in time.
+model RecommendationSnapshot {
+  id            String   @id @default(cuid())
+  householdId   String
+  engineVersion String
+  inputHash     String
+  payload       Json
+  generatedAt   DateTime @default(now())
+
+  household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+
+  @@index([householdId, generatedAt])
+}
+
+// LLM-written plain-English copy for a given (rule, inputs) pair. Cached so
+// the same situation always reads the same way and we don't pay per render.
+// The rules decide WHAT to recommend; this only rewrites the WHY.
+model ExplanationCache {
+  id        String   @id @default(cuid())
+  cacheKey  String   @unique // sha256(ruleId + engineVersion + salient inputs)
+  ruleId    String
+  text      String
+  model     String
+  createdAt DateTime @default(now())
+}
+
+// Every read and write of financial data, appended. Deliberately separate
+// from application logs: this one is queryable, householdscoped, and never
+// contains account numbers or dollar amounts.
+model FinancialAuditLog {
+  id          String   @id @default(cuid())
+  householdId String
+  actorUserId String?
+  action      String // VIEW_OVERVIEW | VIEW_TRANSACTIONS | LINK_ITEM | SYNC | UPDATE_PROFILE | ...
+  resource    String? // ACCOUNT | TRANSACTION | GOAL | ITEM | PROFILE
+  resourceId  String?
+  outcome     String   @default("OK") // OK | DENIED | ERROR
+  meta        Json?
+  createdAt   DateTime @default(now())
+
+  household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+
+  @@index([householdId, createdAt])
 }
