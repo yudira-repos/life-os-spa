@@ -317,6 +317,107 @@ required for budgets, PTO balances, blackouts, flight prices, and anything that
 touches a savings goal. Deliberately softer than FinancialOS: a bank balance is
 not family information the way a school holiday is.
 
+## PropertyOS
+
+Running a house generates two streams of obligation — money out on a schedule
+and work on a schedule — and both are easy to forget until something breaks or
+a penalty lands. Everything in this module exists to make the next 30 days
+visible.
+
+```
+Property        (householdId, state, assessed value, tax rate, + condition flags)
+PropertyBill    (propertyId, category, cadence, typicalAmount, nextDue, detectedKey?)
+BillPayment     (billId, amountCents, paidOn, transactionId?)
+MaintenanceTask (propertyId, templateKey?, intervalDays, nextDue, seasonalMonths?)
+MaintenanceLog  (taskId, completedAt, costCents, vendorId?)
+Vendor          (householdId, trade, phone, rating, lastUsedAt)
+Equipment       (propertyId, kind, isIot, installedOn, warrantyExpiresOn, filterSize, batteryType)
+```
+
+### The three decisions that matter
+
+**Completion, not schedule, drives the next due date.** A 90-day filter change
+due March 1 and actually done March 20 is next due June 18 — not May 30.
+Anchoring to the due date leaves every late task permanently late, and a list
+that's permanently red is a list people stop opening. This is asserted first in
+the verification suite because it's the one that decides whether the module
+gets used after week three.
+
+**The house decides the list.** `catalog.ts` tasks carry conditions and
+adjustments: no water softener, no salt reminder; hard water shortens the
+softener, filter and water-heater intervals; wildfire smoke halves the air
+filter; tree cover doubles gutter cleaning. The interval changes, rather than a
+footnote nobody reads being appended.
+
+**Seasonal is not interval.** "Clean the gutters before the rains" is a month,
+not a spacing. Consecutive months (`[10,11]`) describe one window, so doing it
+on October 5 schedules next October — while separated months (`[4,10]`)
+correctly mean genuinely twice a year. A 60-day minimum separation is what
+distinguishes the two.
+
+### Bills, and where the state data stops
+
+California's property tax schedule is modelled properly — two installments,
+each with a nominal due date and a later delinquency date — because it's
+unambiguous and verified against a county treasurer. The reminder uses the
+**delinquency** date, since that's the one with a 10% penalty attached. The
+installments are 3 and 9 months apart, not 6 and 6, which is why property tax
+recurrence bypasses the generic cadence arithmetic.
+
+Every other state ships as an editable default marked `verified: false`, and
+states where the schedule is genuinely set locally (NY, PA, IL, and others) say
+so and decline to guess. Property tax deadlines vary by county and the
+aggregators that publish state-level tables disagree with each other;
+presenting a scraped date as authoritative is how someone misses a payment.
+
+Bill amounts flag a **price jump** only when a charge is 25% above its own
+trailing average AND at least $25 higher in absolute terms. Percentage alone
+fires constantly on small bills ($8 to $11 is +37%), and an alert that cries
+wolf gets ignored.
+
+### Detection: reading the bills you already pay
+
+`detect.ts` reuses FinancialOS's existing recurring-charge detection and maps
+known utility, insurance and service merchants onto bill categories, so a
+homeowner adopts "PG&E, ~$284, monthly" with one click rather than typing
+twelve bills. Detection produces **suggestions only** — an auto-created bill
+with a wrong cadence produces confident reminders on wrong dates, which is
+worse than no bill. Where the observed spacing doesn't map cleanly to a
+standard cadence, the adopted bill says so instead of silently rounding.
+
+It also names the gaps: essential categories with no bill and no detected
+charge. Not seeing insurance or property tax usually means escrow or an
+unlinked account — worth confirming rather than assuming.
+
+### Equipment, including IoT
+
+The registry answers the three questions nobody can answer when they need to:
+what size is the filter, is it still under warranty, and how old is it really.
+Each costs money when unanswered. `assessEquipment` reports age against a
+typical service life — "past its life" means plan for it, not that it's broken
+— and surfaces a warranty expiring within 90 days, which is the moment to raise
+anything that's been not-quite-right.
+
+IoT devices are treated as equipment with batteries and firmware rather than a
+separate concept. The maintenance catalog carries firmware updates, sensor
+battery checks (a leak detector with a dead battery is worse than none, because
+you believe you're covered), and an annual review of who still has access.
+
+### Access control
+
+Two tiers, same shape as TravelOS. **Viewer** (any member) sees maintenance
+tasks, equipment and vendors, and can mark a task done — whoever cleaned the
+gutters should be able to log it. **Manager** (OWNER/ADULT) is required for
+bills, amounts, payment history and cost rollups. The split is money again.
+
+### Cross-module
+
+`propertyos/integrations.ts` is the whole surface. Confirming the cost rollup
+resizes the FinancialOS home maintenance goal from a rule-of-thumb placeholder
+to a number derived from this house — a year of scheduled maintenance plus a
+year of replacement reserve across the recorded equipment — with the derivation
+written into the goal's notes.
+
 ## The module registry — the extensibility seam
 
 `src/lib/modules.config.ts` is the one place that knows what OS modules
@@ -373,9 +474,9 @@ module that would genuinely use one; see its integrations note below) ·
 shared calendar aggregation across modules · centralized notification
 service · real AI assistant / intent router · Stripe/billing ·
 Apple/Microsoft/passkey login · feature flags · observability pipeline ·
-PropertyOS/HealthOS real business logic · extra hardening for Health data
-(HealthOS still needs the stronger access controls FinancialOS now has,
-before real health data is entered).
+HealthOS real business logic · extra hardening for Health data (HealthOS
+still needs the stronger access controls FinancialOS now has, before real
+health data is entered).
 
 ## File map
 
@@ -400,6 +501,10 @@ src/app/api/travel/               — calendar upload/review/confirm, windows, f
 src/app/(shell)/app/travel/       — TravelOS: Windows, School calendars (+ per-calendar review), Trips, Settings
 scripts/verify-advice-engine.ts   — 53 assertions against the advice engine, no DB (npm run verify:advice)
 scripts/verify-travel-engine.ts   — 40 assertions against calendar parsing and the window engine (npm run verify:travel)
+src/lib/propertyos/               — PropertyOS: catalog (maintenance templates with conditions and interval adjustments), schedule (completion-anchored due dates), bills (cadence math + state property tax schedules), detect (reads FinancialOS recurring charges), equipment (age/warranty/IoT), authz (viewer vs manager), integrations (the home maintenance fund), service (engines <-> database)
+src/app/api/property/             — property, bills (+ adopt, pay), tasks (+ seed, complete, snooze), vendors, equipment, cost sync
+src/app/(shell)/app/property/     — PropertyOS: Overview, Bills, Maintenance, Equipment, Vendors, Property
+scripts/verify-property-engine.ts — 70 assertions against scheduling, bills, tax dates and equipment (npm run verify:property)
 src/components/shell/AppShell.tsx — nav, rendered from the module registry
 src/components/kidsos/            — child sub-nav, practice session UI, activity/career toggles
 src/app/(shell)/app/kids/         — KidsOS: overview + per-child Today/Study/Practice/Activities/Careers/Progress
@@ -418,4 +523,11 @@ webhook-plus-button, investment holdings via Plaid's /investments
 endpoints, and letting a household mark a recommendation as dismissed.
 Inside TravelOS: hotel pricing, a packing/todo checklist per trip, and
 subscribing to a school's ICS feed by URL so calendars refresh themselves
-instead of being re-uploaded each year.
+instead of being re-uploaded each year. Inside PropertyOS: automatic
+matching of bill payments to bank transactions (the matcher exists in
+integrations.ts but isn't wired to a scheduled job yet), photo attachments
+on maintenance logs, and warranty document storage.
+
+Three modules now want the same two things — a notification service and a
+shared calendar. That's the strongest argument yet for building both, and
+for the domain event bus underneath them.

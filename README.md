@@ -127,9 +127,19 @@ and you're in.
   ages, prices real flights, and on confirmation creates a vacation savings
   goal in FinancialOS with a deadline a month before departure. It never
   books anything.
-- **PropertyOS / HealthOS** → registered as real modules with real routes
-  and real entitlement checks, showing a "coming soon" / "locked"
-  placeholder — proving modules can be added without rewriting the Shell.
+- **PropertyOS** → the bills and the upkeep. Tracks property tax (with
+  California's two-installment schedule built in), insurance, utilities, HOA,
+  warranty, gardener and pest control — and if FinancialOS is connected, finds
+  the recurring home charges you're already paying and adopts them with the
+  amount and cadence pre-filled. A maintenance catalog covers HVAC filters,
+  water softener salt, drinking water filters, water heater flushing, gutters,
+  dryer vents, smoke alarms, GFCI tests and smart-home firmware and batteries,
+  with intervals that adjust for hard water, tree cover and dusty air. Plus a
+  vendor book with service history and an equipment registry that tracks filter
+  sizes, warranty expiry and how old things really are.
+- **HealthOS** → registered as a real module with a real route and a real
+  entitlement check, showing a "coming soon" / "locked" placeholder — proving
+  modules can be added without rewriting the Shell.
 - **Settings** → household name, family member list, add a member.
 - **Subscription** → shows what's included, in plain language. No billing
   yet, on purpose.
@@ -141,14 +151,14 @@ also checks the member's role, because bank balances aren't household-wide
 information the way a shared calendar is — see
 `src/lib/financialos/authz.ts`.
 
-Neither FinancialOS nor TravelOS is on the FREE plan. To turn them on for
-every household in your local database:
+FinancialOS, TravelOS and PropertyOS are not on the FREE plan. To turn them
+all on for every household in your local database:
 
 ```bash
 docker compose exec -T postgres psql -U lifeos -d lifeos -c \
 "INSERT INTO \"Entitlement\" (\"id\",\"householdId\",\"moduleId\",\"enabled\")
  SELECT gen_random_uuid()::text, h.id, m, true
- FROM \"Household\" h, (VALUES ('financial'),('travel')) AS t(m)
+ FROM \"Household\" h, (VALUES ('financial'),('travel'),('property')) AS t(m)
  ON CONFLICT (\"householdId\",\"moduleId\") DO UPDATE SET \"enabled\" = true;"
 ```
 
@@ -204,13 +214,14 @@ curl http://localhost:3000/api/health
 ## Verifying the engines
 
 ```bash
-npm run verify          # both suites
-npm run verify:advice   # FinancialOS — 53 assertions
-npm run verify:travel   # TravelOS — 40 assertions
+npm run verify           # all three suites
+npm run verify:advice    # FinancialOS — 53 assertions
+npm run verify:travel    # TravelOS — 40 assertions
+npm run verify:property  # PropertyOS — 70 assertions
 ```
 
-No database, no network, no API keys — both engines are pure functions, so
-the whole chain can be asserted directly.
+No database, no network, no API keys — the engines are pure functions, so the
+whole chain can be asserted directly.
 
 The FinancialOS suite checks the things that cost real money if they're
 wrong: that the employer match is ordered ahead of credit card debt, that a
@@ -226,10 +237,17 @@ breaks intersect to only the shared days, that PTO cost excludes federal
 holidays, and that a blackout demotes a window with its reason shown rather
 than hiding it.
 
+The PropertyOS suite checks the things that make a maintenance list
+trustworthy or useless: that completing a task late reschedules from the day
+it was done rather than the day it was due, that seasonal tasks stay in their
+season, that California's tax installments land on the right delinquency dates
+(and that the gap between them is 3 months and 9, not 6 and 6), that a bill due
+on the 31st clamps to February 28 instead of overflowing into March, and that a
+price-jump alert doesn't fire on an $8 bill going to $11.
+
 ## Next steps (not built yet, see DESIGN.md)
 
-Real recommendation logic instead of static content in KidsOS/FunOS, one more
-module built out for real (HealthOS should adopt the FinancialOS
-access-control pattern), then a simple Stripe checkout once there's something
-worth paying for. See DESIGN.md for what's next inside FinancialOS and
-TravelOS.
+Real recommendation logic instead of static content in KidsOS/FunOS, HealthOS
+built out for real (adopting the FinancialOS access-control pattern), then a
+simple Stripe checkout once there's something worth paying for. Three modules
+now want a notification service and a shared calendar — see DESIGN.md.

@@ -52,6 +52,13 @@ model Household {
   blackoutPeriods   BlackoutPeriod[]
   travelWindows     TravelWindow[]
   trips             Trip[]
+
+  // PropertyOS
+  properties       Property[]
+  propertyBills    PropertyBill[]
+  maintenanceTasks MaintenanceTask[]
+  vendors          Vendor[]
+  equipment        Equipment[]
 }
 
 enum Role {
@@ -763,4 +770,239 @@ model Trip {
   flights   FlightOption[]
 
   @@index([householdId, startDate])
+}
+
+// --- PropertyOS -------------------------------------------------------------
+// Running a house: the bills that must be paid, the maintenance that must
+// happen, the people who do it, and the equipment it happens to.
+//
+// The organising idea is that a house generates two streams of obligation —
+// money out on a schedule, and work on a schedule — and both are easy to
+// forget until something breaks or a penalty lands. Everything here exists to
+// make the next 30 days visible.
+//
+// Money is integer cents, same as FinancialOS. Dates are calendar days, same
+// as TravelOS (via travelos/dates.ts — deliberately reused rather than
+// reimplemented, since off-by-one-day bugs cost real money here too).
+
+model Property {
+  id          String @id @default(cuid())
+  householdId String
+
+  name         String  @default("Home")
+  addressLine  String?
+  city         String?
+  stateCode    String  @default("CA")
+  postalCode   String?
+  propertyType String  @default("SINGLE_FAMILY") // SINGLE_FAMILY | CONDO | TOWNHOME | MULTI_FAMILY | OTHER
+
+  yearBuilt   Int?
+  squareFeet  Int?
+  purchaseDate       DateTime?
+  purchasePriceCents Int?
+
+  // Used to estimate the property tax bill when you haven't entered one.
+  assessedValueCents Int?
+  taxRatePercent     Float? // e.g. 1.25 for a 1.25% effective rate
+
+  // Facts that change which maintenance tasks apply and how often.
+  hasWaterSoftener Boolean @default(false)
+  hasIrrigation    Boolean @default(false)
+  hasPool          Boolean @default(false)
+  hasSepticTank    Boolean @default(false)
+  hasFireplace     Boolean @default(false)
+  hardWater        Boolean @default(false)
+  dustyOrSmoky     Boolean @default(false) // wildfire smoke, desert dust, nearby construction
+  heavyTreeCover   Boolean @default(false) // drives gutter frequency
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  household Household         @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  bills     PropertyBill[]
+  tasks     MaintenanceTask[]
+  equipment Equipment[]
+
+  @@index([householdId])
+}
+
+// A recurring obligation to pay. Either entered by hand or adopted from a
+// recurring charge FinancialOS already detected in the transaction feed.
+model PropertyBill {
+  id          String @id @default(cuid())
+  propertyId  String
+  householdId String
+
+  name     String
+  category String // PROPERTY_TAX | ELECTRIC | GAS | WATER | SEWER | TRASH | INTERNET | INSURANCE | HOA | WARRANTY | LANDSCAPING | PEST | SECURITY | OTHER
+  vendorId String?
+
+  cadence String @default("MONTHLY") // MONTHLY | BIMONTHLY | QUARTERLY | SEMIANNUAL | ANNUAL | SPLIT_SEMIANNUAL | ONE_TIME
+  typicalAmountCents Int @default(0)
+  dueDayOfMonth      Int? // 1-31, for cadences anchored to a day
+  nextDueDate        DateTime?
+  autopay            Boolean @default(false)
+
+  // Set when this bill was adopted from a detected recurring transaction —
+  // the normalized merchant key from financialos/categorize.ts. Keeping it
+  // means we don't re-suggest a bill the user already tracks.
+  detectedKey String?
+
+  lastPaidAt    DateTime?
+  lastPaidCents Int?
+
+  status String  @default("ACTIVE") // ACTIVE | PAUSED | CLOSED
+  notes  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  property  Property       @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  household Household      @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  vendor    Vendor?        @relation(fields: [vendorId], references: [id])
+  payments  BillPayment[]
+
+  @@index([householdId, nextDueDate])
+  @@index([propertyId, status])
+}
+
+model BillPayment {
+  id     String @id @default(cuid())
+  billId String
+
+  amountCents Int
+  paidOn      DateTime
+  source      String  @default("MANUAL") // MANUAL | TRANSACTION
+  transactionId String? // FinancialOS Transaction id, when matched
+  note        String?
+
+  createdAt DateTime @default(now())
+
+  bill PropertyBill @relation(fields: [billId], references: [id], onDelete: Cascade)
+
+  @@index([billId, paidOn])
+}
+
+// A recurring job. The interval is the point: "every 90 days from when it was
+// last actually done", not "the first of every quarter".
+model MaintenanceTask {
+  id          String @id @default(cuid())
+  propertyId  String
+  householdId String
+
+  templateKey String? // key into src/lib/propertyos/catalog.ts, null for custom
+  name        String
+  category    String // HVAC | WATER | EXTERIOR | SAFETY | APPLIANCE | LANDSCAPE | PLUMBING | ELECTRICAL | IOT | OTHER
+  priority    String @default("ROUTINE") // CRITICAL | IMPORTANT | ROUTINE
+
+  intervalDays    Int
+  lastCompletedAt DateTime?
+  nextDueDate     DateTime
+
+  // Seasonal tasks shouldn't drift: "clean gutters before the rains" is a
+  // month, not an interval. CSV of months 1-12; empty means interval-driven.
+  seasonalMonths String?
+
+  equipmentId String?
+  vendorId    String?
+  diy         Boolean @default(true)
+  estimatedCostCents Int @default(0)
+  estimatedMinutes   Int @default(0)
+
+  status String  @default("ACTIVE") // ACTIVE | SNOOZED | ARCHIVED
+  snoozedUntil DateTime?
+  notes  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  property  Property          @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  household Household         @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  equipment Equipment?        @relation(fields: [equipmentId], references: [id], onDelete: SetNull)
+  vendor    Vendor?           @relation(fields: [vendorId], references: [id])
+  logs      MaintenanceLog[]
+
+  @@index([householdId, nextDueDate])
+  @@index([propertyId, status])
+}
+
+model MaintenanceLog {
+  id     String @id @default(cuid())
+  taskId String
+
+  completedAt DateTime
+  costCents   Int      @default(0)
+  vendorId    String?
+  notes       String?
+
+  createdAt DateTime @default(now())
+
+  task   MaintenanceTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  vendor Vendor?         @relation(fields: [vendorId], references: [id])
+
+  @@index([taskId, completedAt])
+}
+
+// The gardener, the plumber, the handyman. Worth keeping because the hardest
+// part of a home repair is remembering who did it well last time.
+model Vendor {
+  id          String @id @default(cuid())
+  householdId String
+
+  name  String
+  trade String // GARDENER | PLUMBER | HANDYMAN | ELECTRICIAN | HVAC | PEST | CLEANER | ROOFER | POOL | APPLIANCE | OTHER
+
+  phone   String?
+  email   String?
+  website String?
+  hourlyRateCents Int?
+  rating  Int? // 1-5
+  notes   String?
+
+  lastUsedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  household Household         @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  bills     PropertyBill[]
+  tasks     MaintenanceTask[]
+  logs      MaintenanceLog[]
+
+  @@index([householdId, trade])
+}
+
+// Everything in the house that has a model number, a warranty, or a filter —
+// including IoT devices, which are just equipment with batteries and firmware.
+model Equipment {
+  id          String @id @default(cuid())
+  propertyId  String
+  householdId String
+
+  name String
+  kind String // HVAC | WATER_HEATER | SOFTENER | RO_FILTER | REFRIGERATOR | WASHER | DRYER | DISHWASHER | GARAGE_DOOR | SOLAR | THERMOSTAT | CAMERA | DOORBELL | SENSOR | HUB | SMOKE_DETECTOR | SPRINKLER | OTHER
+  isIot Boolean @default(false)
+
+  brand        String?
+  model        String?
+  serialNumber String?
+
+  installedOn        DateTime?
+  warrantyExpiresOn  DateTime?
+  expectedLifeYears  Int?
+
+  // The two things you can never find when you need them.
+  filterSize  String?
+  batteryType String?
+
+  notes String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  property  Property          @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  household Household         @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  tasks     MaintenanceTask[]
+
+  @@index([householdId, kind])
 }

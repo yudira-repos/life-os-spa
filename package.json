@@ -10,7 +10,8 @@
     "lint": "eslint",
     "verify:advice": "tsx scripts/verify-advice-engine.ts",
     "verify:travel": "tsx scripts/verify-travel-engine.ts",
-    "verify": "npm run verify:advice && npm run verify:travel"
+    "verify": "npm run verify:advice && npm run verify:travel && npm run verify:property",
+    "verify:property": "tsx scripts/verify-property-engine.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.117.1",

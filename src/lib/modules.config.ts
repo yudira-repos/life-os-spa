@@ -46,9 +46,9 @@ export const MODULES: ModuleDefinition[] = [
     id: "property",
     name: "PropertyOS",
     route: "/app/property",
-    tagline: "Maintenance, repairs, and finances for your home.",
+    tagline: "Bills, maintenance, vendors, and what the house really costs.",
     icon: "home",
-    status: "comingSoon",
+    status: "live",
   },
   {
     id: "health",
