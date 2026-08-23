@@ -10,8 +10,16 @@
     "lint": "eslint",
     "verify:advice": "tsx scripts/verify-advice-engine.ts",
     "verify:travel": "tsx scripts/verify-travel-engine.ts",
-    "verify": "npm run verify:advice && npm run verify:travel && npm run verify:property",
-    "verify:property": "tsx scripts/verify-property-engine.ts"
+    "verify": "npm run verify:advice && npm run verify:travel && npm run verify:property && npm run verify:day",
+    "verify:property": "tsx scripts/verify-property-engine.ts",
+    "verify:day": "tsx scripts/verify-day-engine.ts",
+    "dayos:enable": "tsx scripts/enable-dayos.ts",
+    "dayos:seed": "tsx scripts/seed-dayos-demo.ts",
+    "dayos:simulate": "tsx scripts/dayos-simulate.ts",
+    "dayos:fix-dates": "tsx scripts/normalize-activity-dates.ts",
+    "verify:carpool": "tsx scripts/verify-carpool-roster.ts",
+    "verify:outbox": "node scripts/outbox.test.mjs",
+    "dayos:today": "tsx scripts/materialize-today.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.117.1",

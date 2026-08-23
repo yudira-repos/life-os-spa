@@ -9,6 +9,7 @@
 export type ModuleStatus = "live" | "comingSoon";
 
 export type ModuleId =
+  | "day"
   | "kids"
   | "fun"
   | "property"
@@ -21,11 +22,19 @@ export interface ModuleDefinition {
   name: string;
   route: string;
   tagline: string;
-  icon: "sparkles" | "smile" | "home" | "heart-pulse" | "plane" | "wallet";
+  icon: "sparkles" | "smile" | "home" | "heart-pulse" | "plane" | "wallet" | "calendar-clock";
   status: ModuleStatus;
 }
 
 export const MODULES: ModuleDefinition[] = [
+  {
+    id: "day",
+    name: "DayOS",
+    route: "/app/day",
+    tagline: "Who's doing what today, and when to leave.",
+    icon: "calendar-clock",
+    status: "live",
+  },
   {
     id: "kids",
     name: "KidsOS",
@@ -81,4 +90,4 @@ export function getModule(id: string): ModuleDefinition | undefined {
 }
 
 // Modules included in the FREE plan, seeded automatically for every new household.
-export const FREE_MODULES: ModuleId[] = ["kids", "fun"];
+export const FREE_MODULES: ModuleId[] = ["kids", "fun", "day"];

@@ -59,6 +59,16 @@ model Household {
   maintenanceTasks MaintenanceTask[]
   vendors          Vendor[]
   equipment        Equipment[]
+
+  // DayOS
+  dayPreferences     DayPreferences?
+  places             Place[]
+  contacts           ExternalContact[]
+  coordinationGroups CoordinationGroup[]
+  rotations          Rotation[]
+  activities         Activity[]
+  occurrences        ActivityOccurrence[]
+  travelEstimates    TravelEstimate[]
 }
 
 enum Role {
@@ -106,6 +116,18 @@ model HouseholdMember {
   schoolCalendars    SchoolCalendarChild[] @relation("CalendarChild")
   travelAvailability TravelAvailability?   @relation("TravelAvailability")
   blackoutPeriods    BlackoutPeriod[]      @relation("BlackoutMember")
+
+  // DayOS
+  dayProfile             MemberDayProfile?
+  channels               MemberChannel[]
+  notificationPrefs      MemberNotificationPrefs?
+  groupMemberships       CoordinationGroupMember[]
+  rotationSlots          RotationSlot[]
+  activitiesAsSubject    Activity[]           @relation("ActivitySubject")
+  activitiesAsDefault    Activity[]           @relation("ActivityDefaultResponsible")
+  occurrencesResponsible ActivityOccurrence[] @relation("OccurrenceResponsible")
+  overridesAssigned      AssignmentOverride[] @relation("OverrideAssignee")
+  overridesReplaced      AssignmentOverride[] @relation("OverrideReplaced")
 }
 
 // --- KidsOS: Studies (mastery, practice, gamification) ---------------------
@@ -1005,4 +1027,570 @@ model Equipment {
   tasks     MaintenanceTask[]
 
   @@index([householdId, kind])
+}
+
+// --- DayOS -----------------------------------------------------------------
+// Who is doing what today, and when they need to leave.
+//
+// The other modules answer questions about a horizon: a quarter of bills, a
+// year of maintenance, a school break nine months out. This one answers the
+// next four hours, and that changes what the schema has to be good at.
+//
+// Four rules hold across everything below:
+//
+//   1. A recurring activity stores a WALL-CLOCK TIME (`startMinute`, minutes
+//      since local midnight) and a set of weekdays — never an instant. "Dance
+//      at 5 PM every Tuesday" has to survive a daylight-saving change, and an
+//      instant does not. The instant is resolved per occurrence, in the
+//      household's zone, by src/lib/dayos/time.ts.
+//   2. An ActivityOccurrence is MATERIALIZED, one row per activity per day. It
+//      would be cheaper to compute the day on the fly, but an occurrence is
+//      where a human decision lands — who confirmed, who covered, what was
+//      sent — and those cannot live in a projection that gets recomputed.
+//   3. Anyone who can be responsible for something is either a HouseholdMember
+//      or an ExternalContact. The other parents in a carpool are real
+//      participants in the plan; refusing to model them because they don't
+//      have a LifeOS login would make the carpool feature useless. Every
+//      assignment field is therefore a nullable pair, exactly one of which is
+//      set — enforced in src/lib/dayos/service.ts, since Prisma has no
+//      check constraints.
+//   4. Every outbound message is recorded in NotificationDispatch BEFORE the
+//      send is attempted, keyed uniquely. A worker that ticks every minute and
+//      crashes mid-send must not be able to send the same "drive now" twice.
+
+// Household-level DayOS settings. The time zone lives here rather than on User
+// because a household's day is a single shared thing — the 3:15 pickup is at
+// 3:15 for both parents even when one of them is travelling.
+model DayPreferences {
+  id          String @id @default(cuid())
+  householdId String @unique
+
+  // IANA zone, e.g. "America/Los_Angeles". Every wall-clock time in this
+  // module is interpreted in it.
+  timeZone String @default("America/Los_Angeles")
+
+  morningBriefMinute Int     @default(420) // 07:00 local
+  eveningBriefMinute Int?    // null = off
+  briefEnabled       Boolean @default(true)
+
+  // Defaults applied to new activities; each activity can override.
+  defaultArrivalBufferMinutes Int @default(10)
+  defaultPrepMinutes          Int @default(10)
+
+  // Confirmation ladder timings, in minutes before departure.
+  askLeadMinutes       Int @default(120)
+  remindLeadMinutes    Int @default(45)
+  escalateLeadMinutes  Int @default(25)
+  uncoveredLeadMinutes Int @default(10)
+
+  // Off by default: proactive messages are the module's whole value AND its
+  // whole risk, so a household opts in rather than discovering it at 6 AM.
+  proactiveEnabled Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+}
+
+// Per-adult facts the origin inference needs. Separate from HouseholdMember so
+// the shared member row stays module-neutral.
+model MemberDayProfile {
+  id       String @id @default(cuid())
+  memberId String @unique
+
+  homePlaceId String?
+  workPlaceId String?
+
+  // CSV of weekday digits, Sunday = 0.
+  workWeekdays     String @default("1,2,3,4,5")
+  workStartMinute  Int    @default(540)  // 09:00
+  workEndMinute    Int    @default(1020) // 17:00
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  member    HouseholdMember @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  homePlace Place?          @relation("ProfileHome", fields: [homePlaceId], references: [id], onDelete: SetNull)
+  workPlace Place?          @relation("ProfileWork", fields: [workPlaceId], references: [id], onDelete: SetNull)
+}
+
+// A named location. Calendar events carry free-text locations; a Place is the
+// resolved, reusable version with a geocode, so travel time isn't re-derived
+// from a string every five minutes.
+model Place {
+  id          String @id @default(cuid())
+  householdId String
+
+  label   String
+  kind    String  @default("CUSTOM") // HOME | WORK | SCHOOL | ACTIVITY | MEDICAL | CUSTOM
+  address String
+
+  // Provider place id + geocode, cached after the first resolution.
+  providerPlaceId String?
+  latitude        Float?
+  longitude       Float?
+
+  // Extra minutes this specific place costs on arrival — the school pickup
+  // line, hospital parking. Added to the activity's arrival buffer.
+  parkingBufferMinutes Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  household        Household            @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  activities       Activity[]           @relation("ActivityPlace")
+  activityOrigins  Activity[]           @relation("ActivityOrigin")
+  occurrenceOrigins ActivityOccurrence[] @relation("OccurrenceOrigin")
+  profileHomes     MemberDayProfile[]   @relation("ProfileHome")
+  profileWorks     MemberDayProfile[]   @relation("ProfileWork")
+
+  @@index([householdId, kind])
+}
+
+// Someone outside the household who takes turns or needs to be told: the other
+// carpool parents, a grandparent, a babysitter.
+model ExternalContact {
+  id          String @id @default(cuid())
+  householdId String
+
+  name         String
+  relationship String? // CARPOOL_PARENT | GRANDPARENT | SITTER | COACH | OTHER
+
+  channel        String  @default("NONE") // SMS | WHATSAPP | TELEGRAM | EMAIL | NONE
+  channelAddress String?
+  phone          String?
+  email          String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  household        Household                 @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  groupMemberships CoordinationGroupMember[]
+  rotationSlots    RotationSlot[]
+  occurrences      ActivityOccurrence[]      @relation("OccurrenceResponsibleContact")
+  overridesAs      AssignmentOverride[]      @relation("OverrideAssigneeContact")
+
+  @@index([householdId])
+}
+
+// Where a member can actually be reached. A household member with no channel
+// gets in-app only — which the UI says out loud, because a reminder nobody
+// receives is the failure this module is supposed to prevent.
+model MemberChannel {
+  id       String @id @default(cuid())
+  memberId String
+
+  channel String // TELEGRAM | WHATSAPP | SMS | EMAIL | PUSH | IN_APP
+  address String // chat id, phone number, email — whatever the driver needs
+
+  isPrimary Boolean @default(false)
+  verified  Boolean @default(false)
+  // Quiet hours, local minutes. Non-urgent sends wait; a DRIVE_NOW never does.
+  quietFromMinute Int?
+  quietToMinute   Int?
+
+  createdAt DateTime @default(now())
+
+  member HouseholdMember @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@unique([memberId, channel])
+  @@index([memberId, isPrimary])
+}
+
+// A carpool, a class parent group, the family itself.
+model CoordinationGroup {
+  id          String @id @default(cuid())
+  householdId String
+
+  name String
+  kind String @default("CARPOOL") // CARPOOL | FAMILY | CLASS | OTHER
+
+  // Where this group is broadcast to, as a GROUP rather than as N people.
+  // WHATSAPP addresses are the Baileys JID ("...@g.us"); TELEGRAM is the
+  // numeric chat id (negative for groups). NONE means the group exists for
+  // rostering only and nothing is ever posted to it.
+  channel        String  @default("NONE") // WHATSAPP | TELEGRAM | SMS | NONE
+  channelAddress String?
+
+  // A group post carries no leave times or addresses — only who has the run
+  // and at what time. The other families are not household members and have
+  // not consented to LifeOS knowing where they are.
+  broadcastEnabled Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  household Household                 @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  members   CoordinationGroupMember[]
+  rotations Rotation[]
+
+  @@index([householdId])
+}
+
+model CoordinationGroupMember {
+  id      String @id @default(cuid())
+  groupId String
+
+  memberId  String?
+  contactId String?
+
+  orderIndex Int @default(0)
+
+  group   CoordinationGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  member  HouseholdMember?  @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  contact ExternalContact?  @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@index([groupId, orderIndex])
+}
+
+// Whose turn it is. See src/lib/dayos/rotation.ts for why FIXED_WEEKDAY and
+// ROUND_ROBIN are the only two kinds.
+model Rotation {
+  id          String @id @default(cuid())
+  householdId String
+  groupId     String?
+
+  name String
+  kind String @default("FIXED_WEEKDAY") // FIXED_WEEKDAY | ROUND_ROBIN
+
+  // ROUND_ROBIN counts occurrences from here. Changing it re-phases the whole
+  // rota, so the UI treats it as a destructive edit.
+  anchorDay DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  household  Household            @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  group      CoordinationGroup?   @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  slots      RotationSlot[]
+  activities Activity[]
+  overrides  AssignmentOverride[]
+
+  @@index([householdId])
+}
+
+model RotationSlot {
+  id         String @id @default(cuid())
+  rotationId String
+
+  // Set for FIXED_WEEKDAY (Sunday = 0); ignored for ROUND_ROBIN.
+  weekday    Int?
+  orderIndex Int @default(0)
+
+  memberId  String?
+  contactId String?
+
+  rotation Rotation         @relation(fields: [rotationId], references: [id], onDelete: Cascade)
+  member   HouseholdMember? @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  contact  ExternalContact? @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@index([rotationId, orderIndex])
+}
+
+// A one-day change to the rota. COVER is one-directional and creates a debt;
+// SWAP is written as two rows that exchange two dates and nets to zero. The
+// distinction is the whole reason this table exists rather than a nullable
+// override column on the occurrence.
+model AssignmentOverride {
+  id         String @id @default(cuid())
+  rotationId String
+
+  day  DateTime // UTC midnight — a calendar day
+  kind String   @default("COVER") // COVER | SWAP
+
+  assigneeMemberId  String?
+  assigneeContactId String?
+
+  // Who the roster had. Kept so fairness stays computable after the fact.
+  replacedMemberId  String?
+  replacedContactId String?
+
+  swappedWithDay DateTime?
+  note           String?
+
+  createdByUserId String?
+  createdAt       DateTime @default(now())
+
+  rotation        Rotation         @relation(fields: [rotationId], references: [id], onDelete: Cascade)
+  assigneeMember  HouseholdMember? @relation("OverrideAssignee", fields: [assigneeMemberId], references: [id], onDelete: Cascade)
+  assigneeContact ExternalContact? @relation("OverrideAssigneeContact", fields: [assigneeContactId], references: [id], onDelete: Cascade)
+  replacedMember  HouseholdMember? @relation("OverrideReplaced", fields: [replacedMemberId], references: [id], onDelete: SetNull)
+
+  @@unique([rotationId, day])
+  @@index([rotationId, day])
+}
+
+// The recurring thing itself: school pickup, dance, Kumon, the commute.
+model Activity {
+  id          String @id @default(cuid())
+  householdId String
+
+  name     String
+  category String @default("OTHER") // SCHOOL | CLASS | SPORT | MEDICAL | ERRAND | COMMUTE | RELIGIOUS | SOCIAL | OTHER
+
+  // Who it's FOR. Null for an adult's own commitment.
+  subjectMemberId String?
+
+  placeId       String?
+  // Pin the starting point instead of inferring it (see origin.ts).
+  originPlaceId String?
+
+  // Wall-clock minutes since local midnight. NOT an instant — see the header.
+  startMinute     Int
+  durationMinutes Int?
+
+  // CSV of weekday digits, Sunday = 0. Empty means a single-date activity.
+  weekdays       String   @default("")
+  effectiveFrom  DateTime
+  effectiveTo    DateTime?
+  schoolDaysOnly Boolean  @default(false)
+
+  travelRequired       Boolean @default(true)
+  arrivalBufferMinutes Int?
+  prepMinutes          Int?
+
+  // Exactly one assignment source: a fixed person, or a rotation.
+  defaultResponsibleMemberId String?
+  rotationId                 String?
+
+  requiresConfirmation Boolean @default(false)
+  // CSV of channels to use, empty means each recipient's primary.
+  notifyChannels String  @default("")
+  notifyGroup    Boolean @default(false)
+
+  // DROPOFF | PICKUP for a school run that a carpool group shares. Explicit
+  // rather than sniffed from the name: this string decides how the run is
+  // labelled in a message sent to four other families, and "Pickup 8:00 AM"
+  // because somebody renamed an activity is a wasted trip.
+  carpoolRole String?
+
+  status String @default("ACTIVE") // ACTIVE | PAUSED | ARCHIVED
+
+  // Provenance, so a calendar-derived activity can be re-synced and a
+  // hand-made one is never clobbered by an import.
+  source          String  @default("MANUAL") // MANUAL | CALENDAR | AGENT
+  externalEventId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  household           Household            @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  subjectMember       HouseholdMember?     @relation("ActivitySubject", fields: [subjectMemberId], references: [id], onDelete: SetNull)
+  defaultResponsible  HouseholdMember?     @relation("ActivityDefaultResponsible", fields: [defaultResponsibleMemberId], references: [id], onDelete: SetNull)
+  place               Place?               @relation("ActivityPlace", fields: [placeId], references: [id], onDelete: SetNull)
+  originPlace         Place?               @relation("ActivityOrigin", fields: [originPlaceId], references: [id], onDelete: SetNull)
+  rotation            Rotation?            @relation(fields: [rotationId], references: [id], onDelete: SetNull)
+  skips               ActivitySkip[]
+  occurrences         ActivityOccurrence[]
+
+  @@index([householdId, status])
+  @@unique([householdId, externalEventId])
+}
+
+model ActivitySkip {
+  id         String @id @default(cuid())
+  activityId String
+
+  day    DateTime // UTC midnight
+  reason String?
+
+  createdAt DateTime @default(now())
+
+  activity Activity @relation(fields: [activityId], references: [id], onDelete: Cascade)
+
+  @@unique([activityId, day])
+}
+
+// One day of one activity. The row a human decision lands on.
+model ActivityOccurrence {
+  id          String @id @default(cuid())
+  householdId String
+  activityId  String
+
+  day     DateTime // UTC midnight — the calendar day
+  startAt DateTime // the resolved instant
+  endAt   DateTime?
+
+  responsibleMemberId  String?
+  responsibleContactId String?
+  // ROSTER | COVER | SWAP | DEFAULT | MANUAL | UNASSIGNED
+  assignmentSource     String  @default("UNASSIGNED")
+
+  originPlaceId    String?
+  // CHAINED | SCHEDULE | DEFAULT — never presented as fact when it's a guess.
+  originConfidence String?
+
+  travelMinutes      Int?
+  leaveAt            DateTime?
+  arriveBy           DateTime?
+  estimateComputedAt DateTime?
+  estimateConverged  Boolean   @default(true)
+  retimeAlertsSent   Int       @default(0)
+
+  // The travel time the household was last actually TOLD about this trip, and
+  // when. Re-timing compares against this rather than against the last
+  // computation: a change nobody heard about is not a change to them. It is a
+  // column rather than something re-derived from the message log because the
+  // morning brief covers the whole day in one message — there is no per-trip
+  // dispatch row to read it back off.
+  lastToldTravelMinutes Int?
+  lastToldAt            DateTime?
+
+  // SCHEDULED | PREPARE | DRIVE_NOW | RUNNING_LATE | PASSED
+  phase String @default("SCHEDULED")
+  // NOT_REQUIRED | PENDING | CONFIRMED | DECLINED | REASSIGNED | UNCOVERED
+  confirmationState String @default("NOT_REQUIRED")
+  confirmedAt       DateTime?
+  // CSV of rungs already sent: ASK,REMIND,ESCALATE,BROADCAST,UNCOVERED
+  escalationsSent   String @default("")
+
+  status String  @default("PLANNED") // PLANNED | DONE | CANCELLED
+  notes  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  household           Household        @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  activity            Activity         @relation(fields: [activityId], references: [id], onDelete: Cascade)
+  responsibleMember   HouseholdMember? @relation("OccurrenceResponsible", fields: [responsibleMemberId], references: [id], onDelete: SetNull)
+  responsibleContact  ExternalContact? @relation("OccurrenceResponsibleContact", fields: [responsibleContactId], references: [id], onDelete: SetNull)
+  originPlace         Place?           @relation("OccurrenceOrigin", fields: [originPlaceId], references: [id], onDelete: SetNull)
+  dispatches          NotificationDispatch[]
+
+  @@unique([activityId, day])
+  @@index([householdId, day])
+  @@index([householdId, leaveAt])
+}
+
+// Cached routing results. Keyed by origin, destination and a 15-minute
+// departure bucket on a given weekday, because traffic at 4:15 PM on a Tuesday
+// is a stable fact and asking a paid API for it every five minutes is not.
+model TravelEstimate {
+  id          String @id @default(cuid())
+  householdId String
+
+  originKey      String // place id, or a hash of the address
+  destinationKey String
+
+  weekday          Int // Sunday = 0
+  departureBucket  Int // minutes since local midnight, rounded down to 15
+
+  minutes  Int
+  provider String @default("GOOGLE") // GOOGLE | MOCK
+  // How the number was obtained. LIVE is a real call for this bucket; TYPICAL
+  // is a same-bucket reading from an earlier day, reused rather than re-paid
+  // for. The UI never presents TYPICAL as current traffic.
+  quality  String @default("LIVE") // LIVE | TYPICAL
+
+  observedAt DateTime @default(now())
+
+  household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+
+  @@unique([householdId, originKey, destinationKey, weekday, departureBucket])
+  @@index([householdId, observedAt])
+}
+
+// Written BEFORE the send is attempted, with a unique key, so a worker that
+// crashes mid-tick cannot send the same "drive now" twice.
+model NotificationDispatch {
+  id           String @id @default(cuid())
+  occurrenceId String
+
+  // BRIEF | PREPARE | DRIVE_NOW | RETIME | ASK | REMIND | ESCALATE | BROADCAST | UNCOVERED
+  kind      String
+  channel   String
+  recipient String // member id or contact id, prefixed
+
+  status String  @default("PENDING") // PENDING | SENT | FAILED | SUPPRESSED
+  detail String?
+  body   String?
+
+  createdAt DateTime  @default(now())
+  sentAt    DateTime?
+
+  occurrence ActivityOccurrence @relation(fields: [occurrenceId], references: [id], onDelete: Cascade)
+
+  @@unique([occurrenceId, kind, recipient])
+  @@index([occurrenceId, createdAt])
+}
+
+
+// Which proactive messages a person wants, independent of WHERE they go.
+//
+// Split from MemberChannel deliberately: "I want the morning brief" is a fact
+// about a person, not about a phone number. Someone who swaps their WhatsApp
+// number keeps their preferences; someone who adds SMS as a second channel
+// does not get asked all over again what they want on it.
+//
+// Everything defaults ON except the news brief. The two that default on are
+// the ones a person set this module up FOR — a brief they never see and a
+// departure alert that never fires are both silent failures. A daily news
+// digest is a nice-to-have, and opt-out is the wrong default for those.
+model MemberNotificationPrefs {
+  id       String @id @default(cuid())
+  memberId String @unique
+
+  // The day's schedule, at the household's morning brief time.
+  calendarBrief Boolean @default(true)
+  // "Leave in 12 minutes." The reason DayOS exists.
+  leaveNowAlerts Boolean @default(true)
+  // AI headlines digest, generated by the FastAPI LifeOS.
+  aiNewsBrief Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  member HouseholdMember @relation(fields: [memberId], references: [id], onDelete: Cascade)
+}
+
+// Messages waiting to go out over WhatsApp.
+//
+// This table exists because of a hard constraint, not a preference: the
+// WhatsApp session is a paired device living inside the OpenClaw gateway, and
+// the gateway exposes no HTTP send API — only /v1/chat/completions and
+// /v1/responses, both of which run an agent. So no web server can push a
+// WhatsApp message. The gateway has to PULL.
+//
+// Both apps write here (DayOS directly, the FastAPI LifeOS over HTTP) and a
+// per-minute cron in the gateway drains it with `openclaw message send`.
+//
+// dedupeKey is what makes a retry safe. A crash between "sent" and "marked
+// sent" is the normal failure, and re-sending "leave now" teaches people the
+// alerts are noise — so the key is unique and claiming a row is a conditional
+// update, not a read-then-write.
+model WhatsappOutbox {
+  id String @id @default(cuid())
+
+  // E.164 for a person ("+14155550100"), or a "...@g.us" group id.
+  toAddress String
+  body      String
+
+  // BRIEF | AI_NEWS | DRIVE_NOW | PREPARE | RETIME | ASK | REMIND | ESCALATE |
+  // UNCOVERED | CARPOOL — carried through so a drain failure can be read.
+  kind String @default("BRIEF")
+  // Urgent kinds ignore quiet hours and jump the queue.
+  urgent Boolean @default(false)
+
+  // Stable per logical message. "brief:<memberId>:2026-08-24" is sent once
+  // even if the scheduler runs twice.
+  dedupeKey String @unique
+
+  // PENDING | CLAIMED | SENT | FAILED | EXPIRED
+  status String @default("PENDING")
+  // Claimed rows that are never acked are released back to PENDING after a
+  // grace period, so a gateway crash mid-drain does not strand a message.
+  claimedAt DateTime?
+  sentAt    DateTime?
+  attempts  Int       @default(0)
+  lastError String?
+
+  // A departure alert is worthless late. Past this instant the drain drops it
+  // rather than telling somebody at 09:10 to leave at 08:45.
+  expiresAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([status, createdAt])
+  @@index([status, urgent, createdAt])
 }

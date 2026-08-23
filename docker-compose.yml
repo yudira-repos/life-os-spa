@@ -1,42 +1,19 @@
-# Local dev infrastructure — Postgres + Redis, matching what Railway
-# provisions in production. Run `docker compose up -d`, then `npm run dev`
-# against them (see .env.example for the connection strings this expects).
-#
-# This does NOT run the Next.js app itself — that runs via `npm run dev`
-# on your machine for a fast dev loop. The app is only containerized
-# (Dockerfile) for the Railway deploy. See DESIGN.md.
-
 services:
   postgres:
-    image: postgres:16-alpine
-    restart: unless-stopped
+    image: postgres:15
     environment:
-      POSTGRES_USER: lifeos
-      POSTGRES_PASSWORD: lifeos
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
       POSTGRES_DB: lifeos
     ports:
       - "5432:5432"
     volumes:
-      - lifeos_postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U lifeos -d lifeos"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d lifeos"]
       interval: 5s
       timeout: 5s
-      retries: 10
-
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    ports:
-      - "6379:6379"
-    volumes:
-      - lifeos_redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
+      retries: 5
 
 volumes:
-  lifeos_postgres_data:
-  lifeos_redis_data:
+  postgres_data:

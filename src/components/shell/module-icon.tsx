@@ -1,4 +1,13 @@
-import { Sparkles, Smile, Home, HeartPulse, Plane, Wallet, type LucideIcon } from "lucide-react";
+import {
+  Sparkles,
+  Smile,
+  Home,
+  HeartPulse,
+  Plane,
+  Wallet,
+  CalendarClock,
+  type LucideIcon,
+} from "lucide-react";
 import type { ModuleDefinition } from "@/lib/modules.config";
 
 const ICONS: Record<ModuleDefinition["icon"], LucideIcon> = {
@@ -8,6 +17,7 @@ const ICONS: Record<ModuleDefinition["icon"], LucideIcon> = {
   "heart-pulse": HeartPulse,
   plane: Plane,
   wallet: Wallet,
+  "calendar-clock": CalendarClock,
 };
 
 export function ModuleIcon({ icon, className }: { icon: ModuleDefinition["icon"]; className?: string }) {

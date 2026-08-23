@@ -1,0 +1,45 @@
+# Append to .env.example
+# ---------------------------------------------------------------------------
+
+# --- DayOS ------------------------------------------------------------------
+
+# Google Maps Platform key with the Distance Matrix API enabled. Without it
+# DayOS still works end to end — activities, rotations, confirmations, the
+# brief — but every drive is assumed to take about 20 minutes and every leave
+# time is labelled as an estimate rather than presented as live traffic.
+GOOGLE_MAPS_API_KEY=""
+
+# Shared secret for POST /api/day/tick, the proactive loop's entry point.
+# Until this is set the route returns 503 and no proactive message is ever
+# sent — an endpoint that can message every household is not something to
+# leave open in a misconfigured environment. Generate one with:
+#   openssl rand -base64 32
+DAYOS_TICK_SECRET=""
+
+# Telegram bot token. The only fully automatable channel today: reminders,
+# Confirm / Can't-do-it buttons, and inbound replies all work. Create a bot
+# with @BotFather and paste the token here.
+TELEGRAM_BOT_TOKEN=""
+
+# Email delivery for the morning brief (Resend). Good for the brief, too slow
+# for a departure warning — see the capability table in src/lib/dayos/notify.ts.
+RESEND_API_KEY=""
+DAYOS_MAIL_FROM=""
+
+# SMS delivery (Twilio). Instant and reliable, costs per message, no buttons.
+# The right channel for a grandparent who doesn't use messaging apps.
+TWILIO_ACCOUNT_SID=""
+TWILIO_AUTH_TOKEN=""
+TWILIO_FROM_NUMBER=""
+
+# WhatsApp, iMessage and push are modelled in the channel registry but cannot
+# be sent by LifeOS today. WhatsApp needs a Business account and pre-approved
+# templates; Apple exposes no iMessage send API to third parties; push needs a
+# mobile client that doesn't exist yet. The UI says so at the point a member
+# picks one, rather than failing silently on the day.
+
+# Dev-only. Changes what the mock router answers when GOOGLE_MAPS_API_KEY is
+# absent, so the traffic-change path can be exercised without a paid key. It is
+# ignored whenever a real key is set. scripts/dayos-simulate.ts sets it for you
+# when you pass --traffic-spike.
+DAYOS_MOCK_TRAVEL_MINUTES=""

@@ -3,6 +3,7 @@ import { db } from "@/lib/db";
 import { Card } from "@/components/ui/card";
 import { AddMemberForm } from "@/app/(shell)/settings/add-member-form";
 import { EditChildForm } from "@/app/(shell)/settings/edit-child-form";
+import { NotificationForm } from "@/app/(shell)/settings/notification-form";
 
 export default async function SettingsPage() {
   const household = await getCurrentHousehold();
@@ -23,6 +24,8 @@ export default async function SettingsPage() {
         </p>
         <p className="mt-2 font-medium">{household.name}</p>
       </Card>
+
+      <NotificationForm />
 
       <Card className="mt-4">
         <p className="text-xs font-semibold uppercase tracking-wide text-neutral-500">
